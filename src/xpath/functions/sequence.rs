@@ -13,10 +13,11 @@ use rust_decimal::prelude::ToPrimitive;
 
 use crate::types::value::{XmlAtomicValue, XmlValue};
 use crate::types::XmlTypeCode;
+use crate::xpath::collation::{ActiveCollation, CollationRef};
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::iterator::{VecNodeIterator, XmlItem};
-use crate::xpath::tree_comparer::TreeComparer;
+use crate::xpath::tree_comparer::NodeComparer;
 use crate::xpath::DomNavigator;
 
 use super::numeric::round_half_toward_positive_infinity_f64;
@@ -25,17 +26,34 @@ use super::{
     atomize_to_string_opt, convert, materialize, XPathValue,
 };
 
-/// Default collation URI (codepoint collation).
-const DEFAULT_COLLATION: &str = "http://www.w3.org/2005/xpath-functions/collation/codepoint";
-
-/// Validate collation URI - only default collation is supported.
-/// Returns Ok(()) if collation is valid (default or empty), FOCH0002 otherwise.
-fn validate_collation(collation: Option<&str>) -> Result<(), XPathError> {
-    match collation {
-        None => Ok(()),
-        Some(c) if c.is_empty() || c == DEFAULT_COLLATION => Ok(()),
-        Some(c) => Err(XPathError::unknown_collation(c)),
+/// The collation of a call: its `$collation` argument if it has one, and
+/// otherwise the static context's default collation. The argument is taken off
+/// the back of `args`.
+///
+/// `require` decides when a URI nothing supports becomes FOCH0002. These three
+/// functions use the collation only "when string comparison is required"
+/// (F&O §15.1.5, §15.1.6, §15.3.1), so a *defaulted* collation is carried into
+/// the comparison and raises there — `distinct-values((1, 2, 3))` under an
+/// unsupported default collation compares no strings and must not fail. An
+/// **explicit** argument is different: the caller named a collation for this
+/// call, so an unsupported one is reported at once, which is also what
+/// `fn:deep-equal` has always done with it.
+fn call_collation<N: DomNavigator>(
+    context: &mut DynamicContext<'_, N>,
+    args: &mut Vec<XPathValue<N>>,
+    has_collation_arg: bool,
+    require: bool,
+) -> Result<ActiveCollation, XPathError> {
+    let explicit = if has_collation_arg {
+        atomize_to_string_opt(args.pop().unwrap())?
+    } else {
+        None
+    };
+    let active = crate::xpath::collation::resolve_collation_cached(context, explicit.as_deref());
+    if require {
+        return active.require();
     }
+    Ok(active)
 }
 
 /// Apply the function conversion rules (XPath 2.0 §3.1.5) for an `xs:integer`
@@ -68,8 +86,12 @@ fn require_integer(value: XmlValue, function: &str) -> Result<i64, XPathError> {
 /// `xs:string` (XPath 2.0 §3.5.1), which is what `values_equal` does. An
 /// untyped `2` therefore matches no `xs:integer` and `index-of((1, 2, 3), $u)`
 /// is the empty sequence.
+///
+/// The collation — the `$collation` argument, or the static context's default —
+/// decides the string comparisons and nothing else, which is F&O §15.1.5's
+/// "the collation is used when string comparison is required".
 pub fn index_of<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
@@ -80,10 +102,12 @@ pub fn index_of<N: DomNavigator>(
         ));
     }
 
+    let has_collation_arg = args.len() == 3;
+    let collation = call_collation(context, &mut args, has_collation_arg, has_collation_arg)?;
+
     // Get the sequence (arg 0) and search value (arg 1)
     let seq = args.remove(0);
     let search_arg = args.remove(0);
-    // Collation (arg 2) is ignored for now
 
     // Atomize both
     let seq_values = atomize_sequence(seq)?;
@@ -95,7 +119,7 @@ pub fn index_of<N: DomNavigator>(
     // Find matching positions (1-based)
     let mut positions = Vec::new();
     for (idx, item) in seq_values.iter().enumerate() {
-        if values_equal(item, &search_value) {
+        if values_equal(item, &search_value, collation.as_ref())? {
             positions.push(XmlItem::Atomic(XmlValue::integer(BigInt::from(idx + 1))));
         }
     }
@@ -105,23 +129,53 @@ pub fn index_of<N: DomNavigator>(
 
 /// Compare two atomic values for equality (used by index-of and distinct-values).
 ///
-/// Normalizes UntypedAtomic and AnyUri to string, which is the `eq` rule of
-/// XPath 2.0 §3.5.1 ("If the atomized operand is of type xs:untypedAtomic, it
-/// is cast to xs:string"), and applies numeric type promotion for comparing
-/// different numeric types. A pair whose types `eq` is not defined for — an
-/// `xs:integer` against an `xs:string`, say — compares unequal rather than
-/// raising, which is F&O §15.1.5's "considered to be distinct".
-fn values_equal(left: &XmlValue, right: &XmlValue) -> bool {
+/// F&O §15.1.5 (`fn:index-of`): "The items in the sequence $seqParam are
+/// compared with $srchParam under the rules for the eq operator. Values of
+/// type xs:untypedAtomic are compared as if they were of type xs:string.
+/// Values that cannot be compared, i.e. the eq operator is not defined for
+/// their types, are considered to be distinct." So this is the `eq` operator
+/// itself ([`value_eq_collated`](crate::xpath::operators::value_eq_collated)),
+/// under `collation`, with a pair `eq` is not defined for — an `xs:integer`
+/// against an `xs:string`, say — answering `false` instead of raising. Two
+/// string-like values compare by their string values whatever their types:
+/// `xs:token('a')`, an `xs:NMTOKEN` list member and an `xs:ID` all equal the
+/// `xs:string` `'a'`, as they do under `eq`.
+///
+/// Numeric pairs keep the exact promotion below (decimal↔integer compared as
+/// decimals, float and double promoted), which is `eq`'s as well.
+///
+/// The only error this can raise is therefore FOCH0002 from an unsupported
+/// collation, and only for a pair that actually needed one.
+fn values_equal(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
     let left_norm = normalize_for_comparison(left);
     let right_norm = normalize_for_comparison(right);
 
     // Numeric type promotion: compare numerics as doubles
     if left_norm.type_code.is_numeric() && right_norm.type_code.is_numeric() {
-        return numeric_values_equal(&left_norm, &right_norm);
+        return Ok(numeric_values_equal(&left_norm, &right_norm));
     }
 
-    // Use value equality for non-numeric types
-    left_norm == right_norm
+    eq_or_distinct(&left_norm, &right_norm, collation)
+}
+
+/// `left eq right` under `collation`, where a pair the `eq` operator is not
+/// defined for is simply unequal (F&O §15.1.5, §15.1.6: "considered to be
+/// distinct"). Any other error — FOCH0002 for an unsupported collation — is
+/// raised.
+fn eq_or_distinct(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    match crate::xpath::operators::value_eq_collated(left, right, collation) {
+        Ok(equal) => Ok(equal),
+        Err(XPathError::BinaryOperatorNotDefined { .. }) => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// Compare two numeric values for equality using XPath 2.0 type promotion.
@@ -186,54 +240,30 @@ fn numeric_values_equal_inner(left: &XmlValue, right: &XmlValue, nan_equal: bool
 }
 
 /// Compare two values for equality for fn:distinct-values.
-/// Like values_equal but treats NaN as equal to NaN per XPath 2.0 spec.
-fn distinct_values_equal(left: &XmlValue, right: &XmlValue) -> bool {
+///
+/// F&O §15.1.6: "Equality must be defined for the type of the items … The
+/// values are compared using the eq operator" with "xs:untypedAtomic …
+/// compared as if they were of type xs:string", "Values that cannot be compared,
+/// i.e. the eq operator is not defined for their types, are considered to be
+/// distinct", and — unlike `eq` — NaN equal to NaN. So this is
+/// [`values_equal`] except for the NaN rule.
+fn distinct_values_equal(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
     let left_norm = normalize_for_comparison(left);
     let right_norm = normalize_for_comparison(right);
 
     // Numeric type promotion with NaN == NaN for fn:distinct-values
     if left_norm.type_code.is_numeric() && right_norm.type_code.is_numeric() {
-        return numeric_values_equal_inner(&left_norm, &right_norm, true);
+        return Ok(numeric_values_equal_inner(&left_norm, &right_norm, true));
     }
 
-    // Duration cross-type comparison: P0M == PT0S (both are zero duration)
-    if is_duration_code(left_norm.type_code) && is_duration_code(right_norm.type_code) {
-        return durations_equal(&left_norm, &right_norm);
-    }
-
-    // Use value equality for non-numeric types
-    left_norm == right_norm
-}
-
-fn is_duration_code(code: XmlTypeCode) -> bool {
-    matches!(
-        code,
-        XmlTypeCode::Duration | XmlTypeCode::YearMonthDuration | XmlTypeCode::DayTimeDuration
-    )
-}
-
-/// Compare two duration values for equality.
-/// Handles cross-type comparison (YearMonthDuration vs DayTimeDuration).
-fn durations_equal(left: &XmlValue, right: &XmlValue) -> bool {
-    // Same type: use regular equality
-    if left.type_code == right.type_code {
-        return left == right;
-    }
-    // Cross-type: only zero durations are comparable and equal
-    is_zero_duration(left) && is_zero_duration(right)
-}
-
-/// Check if a duration value is zero.
-fn is_zero_duration(value: &XmlValue) -> bool {
-    match &value.value {
-        crate::types::value::XmlValueKind::Atomic(XmlAtomicValue::YearMonthDuration(d)) => {
-            d.years == 0 && d.months == 0
-        }
-        crate::types::value::XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(d)) => {
-            d.days == 0 && d.hours == 0 && d.minutes == 0 && d.seconds.is_zero()
-        }
-        _ => false,
-    }
+    // Everything else is `eq`: durations compare across their subtypes
+    // (`P0M eq PT0S`, `P12M eq P1Y`), dates and times by their timeline value,
+    // QNames by expanded name, strings under the collation.
+    eq_or_distinct(&left_norm, &right_norm, collation)
 }
 
 /// Normalize a value for comparison (UntypedAtomic and AnyUri become string).
@@ -354,8 +384,12 @@ pub fn exactly_one<N: DomNavigator>(
 ///
 /// Returns the values that appear in the argument with duplicates removed.
 /// Uses value equality with numeric type promotion.
+///
+/// The collation — the `$collation` argument, or the static context's default —
+/// decides which strings count as duplicates, and governs nothing else
+/// (F&O §15.1.6).
 pub fn distinct_values<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.is_empty() || args.len() > 2 {
@@ -366,8 +400,9 @@ pub fn distinct_values<N: DomNavigator>(
         ));
     }
 
+    let has_collation_arg = args.len() == 2;
+    let collation = call_collation(context, &mut args, has_collation_arg, has_collation_arg)?;
     let seq = args.remove(0);
-    // Collation (arg 1) is ignored for now
 
     // Atomize the sequence
     let values = atomize_sequence(seq)?;
@@ -380,9 +415,13 @@ pub fn distinct_values<N: DomNavigator>(
     // (treats NaN as equal to NaN, unlike value comparison)
     let mut distinct: Vec<XmlValue> = Vec::new();
     for value in values {
-        let is_duplicate = distinct
-            .iter()
-            .any(|existing| distinct_values_equal(existing, &value));
+        let mut is_duplicate = false;
+        for existing in &distinct {
+            if distinct_values_equal(existing, &value, collation.as_ref())? {
+                is_duplicate = true;
+                break;
+            }
+        }
         if !is_duplicate {
             distinct.push(value);
         }
@@ -536,79 +575,36 @@ pub fn subsequence<N: DomNavigator>(
         None => None,
     };
 
-    // Handle NaN cases
-    if starting_loc.is_nan() {
-        return Ok(XPathValue::Empty);
-    }
-    if let Some(len) = length {
-        if len.is_nan() {
-            return Ok(XPathValue::Empty);
-        }
-    }
-
-    // Handle infinity cases
-    if starting_loc.is_infinite() && starting_loc.is_sign_positive() {
-        return Ok(XPathValue::Empty);
-    }
-    if let Some(len) = length {
-        if len.is_infinite() && len.is_sign_negative() {
-            return Ok(XPathValue::Empty);
-        }
-    }
-
     // Materialize source sequence
     let items = materialize(source);
 
-    // F&O §15.1.10 selects the items whose position p satisfies
-    // `p >= fn:round($startingLoc)` and `p < fn:round($startingLoc) +
-    // fn:round($length)`, so both arguments go through fn:round's own rounding.
-    let start_rounded = round_half_toward_positive_infinity_f64(starting_loc);
+    // F&O §15.1.10 defines the result as the items whose position `p`
+    // satisfies `fn:round($startingLoc) <= p` and
+    // `p < fn:round($startingLoc) + fn:round($length)`, with both comparisons
+    // evaluated in xs:double arithmetic. Keeping the arithmetic in f64 makes
+    // the infinite and NaN arguments fall out of the same two comparisons:
+    // `-INF` to `+INF` sums to NaN, and every comparison with NaN is false, so
+    // the result is empty.
+    let start = round_half_toward_positive_infinity_f64(starting_loc);
+    let end_exclusive = length.map(|len| start + round_half_toward_positive_infinity_f64(len));
 
-    // Calculate effective start and end positions
-    let (start_idx, end_idx) = match length {
-        Some(len) => {
-            let len_rounded = round_half_toward_positive_infinity_f64(len);
-            // Per spec: items where round(startingLoc) <= position < round(startingLoc) + round(length)
-            // Note: position is 1-based, so item at position p has index p-1
-
-            // Handle negative start adjusting length
-            let effective_start = if start_rounded < 1.0 {
-                // If start is negative, we skip fewer items but the length is reduced
-                1.0
-            } else {
-                start_rounded
-            };
-
-            // Calculate length adjustment for negative start
-            let adjusted_len = if start_rounded < 1.0 {
-                len_rounded + start_rounded - 1.0
-            } else {
-                len_rounded
-            };
-
-            if adjusted_len <= 0.0 {
-                return Ok(XPathValue::Empty);
-            }
-
-            let start = (effective_start - 1.0).max(0.0) as usize;
-            let end = (effective_start - 1.0 + adjusted_len).min(items.len() as f64) as usize;
-            (start, end)
-        }
-        None => {
-            // No length specified - go to end
-            if start_rounded < 1.0 {
-                (0, items.len())
-            } else {
-                let start = (start_rounded - 1.0).max(0.0) as usize;
-                (start, items.len())
-            }
-        }
-    };
-
-    // Handle out of range
-    if start_idx >= items.len() {
+    if start.is_nan() || end_exclusive.is_some_and(f64::is_nan) {
         return Ok(XPathValue::Empty);
     }
+
+    let count = items.len() as f64;
+    // Both bounds are integer-valued (or infinite), so `p < end` is
+    // `p <= end - 1` over the integer positions.
+    let first_position = start.max(1.0);
+    let last_position = match end_exclusive {
+        Some(end) => (end - 1.0).min(count),
+        None => count,
+    };
+    if first_position > count || first_position > last_position {
+        return Ok(XPathValue::Empty);
+    }
+    let start_idx = (first_position - 1.0) as usize;
+    let end_idx = last_position as usize;
 
     // Extract subsequence
     let result: Vec<XmlItem<N>> = items
@@ -654,7 +650,7 @@ pub fn unordered<N: DomNavigator>(
 /// Two sequences are deep-equal if they have the same length and each pair
 /// of corresponding items are deep-equal.
 pub fn deep_equal<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
@@ -665,12 +661,12 @@ pub fn deep_equal<N: DomNavigator>(
         ));
     }
 
-    // Validate collation if provided (third argument)
-    if args.len() == 3 {
-        let collation_arg = args.pop().unwrap();
-        let collation = atomize_to_string_opt(collation_arg)?;
-        validate_collation(collation.as_deref())?;
-    }
+    // `fn:deep-equal` always requires its collation, defaulted or not: the
+    // comparison engine behind it answers `bool` at every level and has nowhere
+    // to carry an error to, so a collation it cannot use must be refused before
+    // the walk starts rather than silently become the codepoint one.
+    let has_collation_arg = args.len() == 3;
+    let collation = call_collation(context, &mut args, has_collation_arg, true)?;
 
     let param1 = args.remove(0);
     let param2 = args.remove(0);
@@ -683,8 +679,22 @@ pub fn deep_equal<N: DomNavigator>(
     let iter1: VecNodeIterator<N> = VecNodeIterator::new(items1);
     let iter2: VecNodeIterator<N> = VecNodeIterator::new(items2);
 
-    // Use TreeComparer for deep equality
-    let comparer = TreeComparer::default();
+    // The `fn:deep-equal` content model (F&O §15.3.1), not the stricter
+    // comparison the published `TreeComparer` performs: comment and
+    // processing-instruction *children* play no part, and an element is
+    // compared according to its content — typed value for simple content,
+    // child elements only for element-only content, `(*|text())` for mixed.
+    // The static context's schema set is what makes the content kind of a
+    // complex type readable; with none, every element is `xs:untyped`, hence
+    // mixed, which is the unvalidated behaviour.
+    //
+    // The collation travels with the comparer: F&O §15.3.1 uses it wherever the
+    // rule compares two strings — text and comment nodes, processing-instruction
+    // contents, typed values of elements and attributes, and free-standing
+    // atomic items — "but not when names are compared", so element, attribute
+    // and PI *names* stay codepoint comparisons.
+    let comparer =
+        NodeComparer::deep_equal_function(context.static_context.schema_set, collation.as_ref());
     let result = comparer.deep_equal_iter(&iter1, &iter2)?;
 
     Ok(XPathValue::boolean(result))
@@ -1276,5 +1286,75 @@ mod tests {
         let args = vec![seq1, seq2];
         let result = deep_equal(&mut ctx, args).unwrap();
         assert!(!extract_bool(result));
+    }
+
+    /// The document element of `doc`, as a one-item argument sequence.
+    fn document_element<'d>(doc: &'d roxmltree::Document<'d>) -> XPathValue<RoXmlNavigator<'d>> {
+        let mut nav = RoXmlNavigator::new(doc);
+        assert!(nav.move_to_first_child(), "a document element");
+        XPathValue::from_sequence(vec![XmlItem::Node(nav)])
+    }
+
+    /// F&O §15.3.1 compares an element's `(*|text())`, so comment and
+    /// processing-instruction children play no part. Checked through the
+    /// function itself, not through the comparer.
+    #[test]
+    fn deep_equal_ignores_comment_and_pi_children() {
+        let plain = roxmltree::Document::parse("<a>x</a>").expect("parse xml");
+
+        for xml in ["<a>x<!--c--></a>", "<a><!--c-->x</a>", "<a>x<?p d?></a>"] {
+            let with_noise = roxmltree::Document::parse(xml).expect("parse xml");
+            let mut ctx = make_context();
+            let args = vec![document_element(&with_noise), document_element(&plain)];
+            assert!(
+                extract_bool(deep_equal(&mut ctx, args).unwrap()),
+                "{xml} should be deep-equal to <a>x</a>",
+            );
+        }
+    }
+
+    /// …but such a child still splits the text around it, and text nodes are
+    /// never merged, so `<a>x<!--c-->y</a>` has two text children where
+    /// `<a>xy</a>` has one.
+    #[test]
+    fn deep_equal_does_not_merge_text_split_by_a_comment() {
+        let split = roxmltree::Document::parse("<a>x<!--c-->y</a>").expect("parse xml");
+        let joined = roxmltree::Document::parse("<a>xy</a>").expect("parse xml");
+
+        let mut ctx = make_context();
+        let args = vec![document_element(&split), document_element(&joined)];
+        assert!(!extract_bool(deep_equal(&mut ctx, args).unwrap()));
+    }
+
+    /// A comment or PI that is itself an item of the compared sequences is
+    /// compared — by string value, and for a PI by target as well.
+    #[test]
+    fn deep_equal_compares_comment_and_pi_items() {
+        let doc =
+            roxmltree::Document::parse("<a><!--c--><!--d--><?p v?><?q v?></a>").expect("parse xml");
+
+        let child = |index: usize| -> XPathValue<RoXmlNavigator<'_>> {
+            let mut nav = RoXmlNavigator::new(&doc);
+            assert!(nav.move_to_first_child(), "a document element");
+            assert!(nav.move_to_first_child(), "a child node");
+            for _ in 0..index {
+                assert!(nav.move_to_next_sibling(), "a child node");
+            }
+            XPathValue::from_sequence(vec![XmlItem::Node(nav)])
+        };
+
+        let mut ctx = make_context();
+        assert!(extract_bool(
+            deep_equal(&mut ctx, vec![child(0), child(0)]).unwrap()
+        ));
+        assert!(!extract_bool(
+            deep_equal(&mut ctx, vec![child(0), child(1)]).unwrap()
+        ));
+        assert!(extract_bool(
+            deep_equal(&mut ctx, vec![child(2), child(2)]).unwrap()
+        ));
+        assert!(!extract_bool(
+            deep_equal(&mut ctx, vec![child(2), child(3)]).unwrap()
+        ));
     }
 }

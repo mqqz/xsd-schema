@@ -20,14 +20,28 @@
 pub mod arena;
 pub mod ast;
 pub mod axis_iterators;
+// String comparison under a collation, and the host callback that supplies
+// every collation other than the Unicode codepoint one.
+pub mod collation;
 pub mod context;
 pub mod error;
 pub mod item_set;
 pub mod iterator;
+// Indexed evaluation of the general comparison operators. Internal: it only
+// ever changes how fast `operators` answers a comparison, never the answer.
+pub(crate) mod general_compare;
+// Reuse of a general-comparison index across evaluations of one comparison
+// node, for the duration of one evaluation run. Internal, and likewise
+// answer-preserving.
+pub(crate) mod compare_cache;
 pub mod lexer;
 pub mod node_test;
 pub mod operators;
 pub mod parser;
+// Reuse of the compiled programs of `fn:matches` / `fn:replace` / `fn:tokenize`
+// across the calls of one evaluation run. Internal, and likewise
+// answer-preserving.
+pub(crate) mod regex_cache;
 pub mod timsort;
 pub mod tree_comparer;
 
@@ -76,6 +90,7 @@ pub use self::axis_iterators::{
     SpecialChildNodeIterator, SpecialDescendantNodeIterator,
 };
 pub use self::bind::bind_node;
+pub use self::collation::{Collation, CollationResolver, CODEPOINT_COLLATION_URI};
 pub use self::context::{DynamicContext, NameBinder, VarRef, VarSlotId, VarStore, XPathContext};
 pub use self::deps::FunctionCallRef;
 pub use self::error::XPathError;

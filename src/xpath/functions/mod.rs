@@ -393,15 +393,14 @@ impl<N: DomNavigator> XPathValue<N> {
         }
     }
 
-    /// Get a reference to items as a slice
+    /// Borrow the items as a slice, without cloning: empty for `Empty`, one
+    /// element for `Item`, and the whole sequence for `Sequence`.
+    ///
+    /// The slice always has [`len`](Self::len) elements, in sequence order.
     pub fn as_slice(&self) -> &[XmlItem<N>] {
         match self {
             Self::Empty => &[],
-            Self::Item(_) => {
-                // Can't return a slice to a single owned item safely
-                // This is a limitation - callers should use into_vec() for this case
-                &[]
-            }
+            Self::Item(item) => std::slice::from_ref(item),
             Self::Sequence(items) => items,
         }
     }
@@ -468,219 +467,240 @@ impl<N: DomNavigator> XPathValue<N> {
 // Helper Functions for Argument Processing
 // ============================================================================
 
+/// The value one item atomizes to before a packed list is taken apart
+/// (XPath 2.0 §2.4.2): a node's typed value, `None` for a nilled element; an
+/// atomic item itself, a union value unwrapped to the value of its member type.
+/// A packed list value — the stored typed value of a list-typed node — stands
+/// for its members ([`atomize::unpack_list`]), which the callers below take
+/// apart.
+fn item_value<N: DomNavigator>(item: XmlItem<N>) -> Result<Option<XmlValue>, XPathError> {
+    match item {
+        XmlItem::Node(nav) => atomize::atomize_node(&nav),
+        XmlItem::Atomic(value) => Ok(Some(atomize::unwrap_union_owned(value))),
+    }
+}
+
+/// The single atomic value one item atomizes to: `None` for none (a nilled
+/// element, an empty list), XPTY0004 for a list-typed node with more than one
+/// member.
+fn item_at_most_one<N: DomNavigator>(item: XmlItem<N>) -> Result<Option<XmlValue>, XPathError> {
+    match item_value(item)? {
+        None => Ok(None),
+        Some(value) => atomize::single_atom(value),
+    }
+}
+
+/// Append the atomic values one item atomizes to: one per member of a
+/// list-typed node, none for a nilled element.
+fn push_item_atoms<N: DomNavigator>(
+    item: XmlItem<N>,
+    out: &mut Vec<XmlValue>,
+) -> Result<(), XPathError> {
+    if let Some(value) = item_value(item)? {
+        atomize::push_atoms(value, out);
+    }
+    Ok(())
+}
+
 /// Atomize a value and convert to string.
 ///
-/// This handles:
-/// - Empty value -> empty string
-/// - Single item -> atomized string value
-/// - Sequence -> error (XPTY0004)
+/// The value is atomized as the function conversion rules require (XPath 2.0
+/// §3.1.5): a node contributes its typed value, not its string value, so a
+/// typed node gives the string form of its typed value and an element with
+/// element-only content raises `FOTY0012`. This handles:
+/// - Empty value, or a node whose typed value is empty -> empty string
+/// - Single atomic value after atomization -> its string value
+/// - More than one item or atomic value -> error (XPTY0004)
 pub fn atomize_to_string<N: DomNavigator>(value: XPathValue<N>) -> Result<String, XPathError> {
-    match value {
-        XPathValue::Empty => Ok(String::new()),
-        XPathValue::Item(item) => item_to_string(item),
-        XPathValue::Sequence(items) => {
-            if items.len() == 1 {
-                item_to_string(items.into_iter().next().unwrap())
-            } else {
-                Err(XPathError::more_than_one_item())
-            }
-        }
-    }
+    Ok(atomize_to_string_opt(value)?.unwrap_or_default())
 }
 
 /// Atomize a value and convert to required string.
 ///
-/// Returns error if the value is empty or contains more than one item.
+/// Returns error if the value atomizes to the empty sequence or to more than
+/// one atomic value.
 pub fn atomize_to_string_required<N: DomNavigator>(
     value: XPathValue<N>,
 ) -> Result<String, XPathError> {
-    match value {
-        XPathValue::Empty => Err(XPathError::XPTY0004 {
-            expected: "xs:string".to_string(),
-            found: "empty-sequence()".to_string(),
-        }),
-        other => atomize_to_string(other),
-    }
+    atomize_to_string_opt(value)?.ok_or_else(|| XPathError::XPTY0004 {
+        expected: "xs:string".to_string(),
+        found: "empty-sequence()".to_string(),
+    })
 }
 
 /// Atomize a value and convert to string with strict type checking.
 ///
 /// Per XPath 2.0, only xs:string, xs:untypedAtomic, and xs:anyURI can be
-/// promoted to xs:string. Other types (e.g., xs:integer) raise XPTY0004.
-/// Empty value returns empty string.
+/// promoted to xs:string. Other types (e.g., xs:integer) raise XPTY0004 —
+/// including the typed value of a node, which is atomized first (§3.1.5).
+/// A value that atomizes to the empty sequence returns the empty string.
 pub fn atomize_to_string_strict<N: DomNavigator>(
     value: XPathValue<N>,
 ) -> Result<String, XPathError> {
-    match value {
-        XPathValue::Empty => Ok(String::new()),
-        XPathValue::Item(item) => item_to_string_strict(item),
-        XPathValue::Sequence(items) => {
-            if items.len() == 1 {
-                item_to_string_strict(items.into_iter().next().unwrap())
-            } else {
-                Err(XPathError::more_than_one_item())
-            }
-        }
-    }
+    Ok(atomize_to_string_strict_opt(value)?.unwrap_or_default())
 }
 
 /// Atomize a value and convert to optional string with strict type checking.
 ///
-/// Returns None for empty sequences.
+/// Returns None for a value that atomizes to the empty sequence.
 pub fn atomize_to_string_strict_opt<N: DomNavigator>(
     value: XPathValue<N>,
 ) -> Result<Option<String>, XPathError> {
-    match value {
-        XPathValue::Empty => Ok(None),
-        other => atomize_to_string_strict(other).map(Some),
-    }
+    atomize_to_single_opt(value)?
+        .map(atomic_to_string_strict)
+        .transpose()
 }
 
-/// Convert an XmlItem to string with strict type checking.
+/// Convert an atomized value to string with strict type checking.
 /// Only xs:string, xs:untypedAtomic, and xs:anyURI types are accepted.
-fn item_to_string_strict<N: DomNavigator>(item: XmlItem<N>) -> Result<String, XPathError> {
-    match item {
-        XmlItem::Atomic(value) => match value.type_code {
-            XmlTypeCode::String
-            | XmlTypeCode::UntypedAtomic
-            | XmlTypeCode::AnyUri
-            | XmlTypeCode::NormalizedString
-            | XmlTypeCode::Token
-            | XmlTypeCode::Language
-            | XmlTypeCode::NmToken
-            | XmlTypeCode::Name
-            | XmlTypeCode::NCName
-            | XmlTypeCode::Id
-            | XmlTypeCode::IdRef
-            | XmlTypeCode::Entity => Ok(atomize::string_value(&value)),
-            _ => Err(XPathError::XPTY0004 {
-                expected: "xs:string".to_string(),
-                found: crate::xpath::type_info::type_code_to_name(value.type_code).to_string(),
-            }),
-        },
-        XmlItem::Node(nav) => Ok(nav.value()),
+fn atomic_to_string_strict(value: XmlValue) -> Result<String, XPathError> {
+    match value.type_code {
+        XmlTypeCode::String
+        | XmlTypeCode::UntypedAtomic
+        | XmlTypeCode::AnyUri
+        | XmlTypeCode::NormalizedString
+        | XmlTypeCode::Token
+        | XmlTypeCode::Language
+        | XmlTypeCode::NmToken
+        | XmlTypeCode::Name
+        | XmlTypeCode::NCName
+        | XmlTypeCode::Id
+        | XmlTypeCode::IdRef
+        | XmlTypeCode::Entity => Ok(atomize::string_value(&value)),
+        _ => Err(XPathError::XPTY0004 {
+            expected: "xs:string".to_string(),
+            found: crate::xpath::type_info::type_code_to_name(value.type_code).to_string(),
+        }),
     }
 }
 
 /// Atomize a value and convert to optional string.
 ///
-/// Returns None for empty sequences.
+/// Returns None for a value that atomizes to the empty sequence.
 pub fn atomize_to_string_opt<N: DomNavigator>(
     value: XPathValue<N>,
 ) -> Result<Option<String>, XPathError> {
-    match value {
-        XPathValue::Empty => Ok(None),
-        other => atomize_to_string(other).map(Some),
-    }
+    Ok(atomize_to_single_opt(value)?.map(|atomic| atomize::string_value(&atomic)))
 }
 
-/// Convert an XmlItem to string
-fn item_to_string<N: DomNavigator>(item: XmlItem<N>) -> Result<String, XPathError> {
-    match item {
-        XmlItem::Atomic(value) => Ok(atomize::string_value(&value)),
-        XmlItem::Node(nav) => Ok(nav.value()),
-    }
-}
-
-/// Atomize a value and convert to double.
-///
-/// This handles:
-/// - Empty value -> NaN
-/// - Single item -> atomized double value
-/// - Sequence -> error (XPTY0004)
-pub fn atomize_to_double<N: DomNavigator>(value: XPathValue<N>) -> Result<f64, XPathError> {
+/// `fn:string` of a value holding at most one item (F&O §2.3): the string
+/// value of a node — the whole text, never its typed value — or the string
+/// form of an atomic value, and the empty string for the empty sequence.
+/// More than one item is an error.
+pub(crate) fn string_of_single<N: DomNavigator>(
+    value: XPathValue<N>,
+) -> Result<String, XPathError> {
     match value {
-        XPathValue::Empty => Ok(f64::NAN),
-        XPathValue::Item(item) => item_to_double(item),
+        XPathValue::Empty => Ok(String::new()),
+        XPathValue::Item(item) => Ok(item_string_value(item)),
         XPathValue::Sequence(items) => {
             if items.len() == 1 {
-                item_to_double(items.into_iter().next().unwrap())
+                Ok(item_string_value(items.into_iter().next().unwrap()))
             } else {
-                Err(XPathError::more_than_one_item())
+                Err(too_many_items("zero or one item"))
             }
         }
     }
 }
 
-/// Convert an XmlItem to double
-fn item_to_double<N: DomNavigator>(item: XmlItem<N>) -> Result<f64, XPathError> {
-    match item {
-        XmlItem::Atomic(value) => Ok(atomize::to_number(&value)),
-        XmlItem::Node(nav) => {
-            let s = nav.value();
-            Ok(s.trim().parse().unwrap_or(f64::NAN))
-        }
+/// The error for a value of more than one item where at most one is allowed.
+///
+/// XPath 2.0 §3.1.5, the function conversion rules: "If, after the above
+/// conversions, the resulting value does not match the expected type according
+/// to the rules for SequenceType Matching, a type error is raised
+/// \[err:XPTY0004\]"; the operators state the same rule for their operands
+/// (§3.4, §3.5.1, §3.5.3, §3.10.2). XPDY0050 is `treat as`'s code (§3.10.5),
+/// not this one.
+pub(crate) fn too_many_items(expected: &str) -> XPathError {
+    XPathError::XPTY0004 {
+        expected: expected.to_string(),
+        found: "a sequence of more than one item".to_string(),
     }
+}
+
+/// The string value of a node, or the string form of an atomic value.
+fn item_string_value<N: DomNavigator>(item: XmlItem<N>) -> String {
+    match item {
+        XmlItem::Atomic(value) => atomize::string_value(&value),
+        XmlItem::Node(nav) => nav.value(),
+    }
+}
+
+/// Atomize a value and convert to double, with `fn:number` semantics.
+///
+/// This handles:
+/// - Empty value, or a node whose typed value is empty -> NaN
+/// - Single atomic value after atomization -> its numeric value (NaN when it
+///   does not convert); a node contributes its typed value (§3.1.5)
+/// - More than one item or atomic value -> error (XPTY0004)
+pub fn atomize_to_double<N: DomNavigator>(value: XPathValue<N>) -> Result<f64, XPathError> {
+    Ok(match atomize_to_single_opt(value)? {
+        None => f64::NAN,
+        Some(atomic) => atomize::to_number(&atomic),
+    })
 }
 
 /// Atomize a value to a single XmlValue.
 ///
-/// Returns error if the value is empty or contains more than one item.
+/// Returns error if the value atomizes to the empty sequence or to more than
+/// one atomic value.
 pub fn atomize_to_single<N: DomNavigator>(value: XPathValue<N>) -> Result<XmlValue, XPathError> {
-    match value {
-        XPathValue::Empty => Err(XPathError::XPTY0004 {
-            expected: "item()".to_string(),
-            found: "empty-sequence()".to_string(),
-        }),
-        XPathValue::Item(item) => item_to_atomic(item),
-        XPathValue::Sequence(items) => {
-            if items.len() == 1 {
-                item_to_atomic(items.into_iter().next().unwrap())
-            } else {
-                Err(XPathError::more_than_one_item())
-            }
-        }
-    }
+    atomize_to_single_opt(value)?.ok_or_else(|| XPathError::XPTY0004 {
+        expected: "item()".to_string(),
+        found: "empty-sequence()".to_string(),
+    })
 }
 
 /// Atomize a value to an optional XmlValue.
+///
+/// `None` when the value atomizes to the empty sequence: the empty value, a
+/// nilled element, or a list-typed node with no members (XPath 2.0 §3.4,
+/// §3.5.1: "If the atomized operand is an empty sequence, the result … is an
+/// empty sequence"). More than one item is a type error (XPTY0004, XPath 2.0
+/// §3.1.5), and so is a single list-typed node with more than one member.
 pub fn atomize_to_single_opt<N: DomNavigator>(
     value: XPathValue<N>,
 ) -> Result<Option<XmlValue>, XPathError> {
-    match value {
-        XPathValue::Empty => Ok(None),
-        other => atomize_to_single(other).map(Some),
-    }
+    atomize_at_most_one(value, "zero or one item")
 }
 
-/// Convert an XmlItem to an atomic XmlValue.
-///
-/// For nodes, uses `atomize_node()` which may return `None` for nilled elements.
-/// In a single-item context, `None` is promoted to an error.
-fn item_to_atomic<N: DomNavigator>(item: XmlItem<N>) -> Result<XmlValue, XPathError> {
-    match item {
-        XmlItem::Atomic(value) => atomize::atomize(&value),
-        XmlItem::Node(nav) => atomize::atomize_node(&nav)?
-            .ok_or_else(|| XPathError::type_mismatch("item()", "empty-sequence()")),
+/// [`atomize_to_single_opt`], naming the expected type in the XPTY0004 raised
+/// for more than one item.
+pub(crate) fn atomize_at_most_one<N: DomNavigator>(
+    value: XPathValue<N>,
+    expected: &str,
+) -> Result<Option<XmlValue>, XPathError> {
+    match value {
+        XPathValue::Empty => Ok(None),
+        XPathValue::Item(item) => item_at_most_one(item),
+        XPathValue::Sequence(items) => {
+            if items.len() == 1 {
+                item_at_most_one(items.into_iter().next().unwrap())
+            } else {
+                Err(too_many_items(expected))
+            }
+        }
     }
 }
 
 /// Atomize all items in a value to a sequence of XmlValues.
 ///
-/// Nilled elements (which atomize to `None`) are silently skipped.
+/// Nilled elements (which atomize to the empty sequence) contribute nothing,
+/// and a list-typed node contributes one value per member.
 pub fn atomize_sequence<N: DomNavigator>(
     value: XPathValue<N>,
 ) -> Result<Vec<XmlValue>, XPathError> {
     match value {
         XPathValue::Empty => Ok(Vec::new()),
-        XPathValue::Item(item) => match item {
-            XmlItem::Atomic(value) => Ok(vec![atomize::atomize(&value)?]),
-            XmlItem::Node(nav) => match atomize::atomize_node(&nav)? {
-                Some(v) => Ok(vec![v]),
-                None => Ok(Vec::new()),
-            },
-        },
+        XPathValue::Item(item) => {
+            let mut result = Vec::with_capacity(1);
+            push_item_atoms(item, &mut result)?;
+            Ok(result)
+        }
         XPathValue::Sequence(items) => {
             let mut result = Vec::with_capacity(items.len());
             for item in items {
-                match item {
-                    XmlItem::Atomic(value) => result.push(atomize::atomize(&value)?),
-                    XmlItem::Node(nav) => {
-                        if let Some(v) = atomize::atomize_node(&nav)? {
-                            result.push(v);
-                        }
-                    }
-                }
+                push_item_atoms(item, &mut result)?;
             }
             Ok(result)
         }
@@ -950,7 +970,16 @@ fn eval_fn_string<N: DomNavigator>(
         }
         1 => {
             let arg = args.remove(0);
-            let s = atomize_to_string(arg)?;
+            // XPath 1.0 compatibility mode: the argument of a function whose
+            // parameter is a singleton is replaced by its first item, so
+            // `string(//a)` is the string value of the first `a` instead of a
+            // type error.
+            let s = if context.static_context.xpath10_compatibility() {
+                atomize::to_string_10(&arg)
+            } else {
+                // The string value of a node, not its atomized typed value.
+                string_of_single(arg)?
+            };
             Ok(XPathValue::string(s))
         }
         _ => Err(XPathError::wrong_number_of_arguments(
@@ -961,26 +990,31 @@ fn eval_fn_string<N: DomNavigator>(
     }
 }
 
+/// `fn:number` (F&O §14.4).
+///
+/// XPath 1.0 compatibility mode needs nothing of its own here. The parameter
+/// is `xs:anyAtomicType?`, so of the three compatibility steps of the function
+/// conversion rules (XPath 2.0 §3.1.5) only the first applies — "the value V
+/// is effectively replaced by V\[1\]" — and the evaluator has already taken it
+/// for every function call before dispatch (`apply_function_conversion_10` in
+/// `eval.rs`). The normal rules follow, in either mode: the argument is
+/// atomized, so a node contributes its typed value rather than its string
+/// value, and a value that does not convert is NaN.
 fn eval_fn_number<N: DomNavigator>(
     context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     match args.len() {
         0 => {
-            // 0 args: to_number of context item
+            // F&O §14.4: "fn:number() is equivalent to fn:number(.)" — the
+            // context item after atomization, so a typed node contributes its
+            // typed value, exactly as it does when passed as the argument.
             let item = context.require_context_item()?.clone();
-            let d = match item {
-                XmlItem::Node(nav) => {
-                    let s = nav.value();
-                    s.trim().parse().unwrap_or(f64::NAN)
-                }
-                XmlItem::Atomic(v) => atomize::to_number(&v),
-            };
+            let d = atomize_to_double(XPathValue::from_item(item))?;
             Ok(XPathValue::double(d))
         }
         1 => {
-            let arg = args.remove(0);
-            let d = atomize_to_double(arg)?;
+            let d = atomize_to_double(args.remove(0))?;
             Ok(XPathValue::double(d))
         }
         _ => Err(XPathError::wrong_number_of_arguments(
@@ -1177,6 +1211,34 @@ mod tests {
         let value = XPathValue::from_sequence(items);
         assert_eq!(value.len(), 2);
         assert!(!value.is_single());
+    }
+
+    /// `as_slice` agrees with `len` and `first` for all three shapes; the
+    /// single-item shape used to answer with an empty slice.
+    #[test]
+    fn test_xpath_value_as_slice() {
+        let empty: XPathValue<RoXmlNavigator<'static>> = XPathValue::empty();
+        assert!(empty.as_slice().is_empty());
+
+        let single: XPathValue<RoXmlNavigator<'static>> = XPathValue::integer(7);
+        assert!(single.is_single());
+        let slice = single.as_slice();
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice.len(), single.len());
+        assert!(std::ptr::eq(&slice[0], single.first().unwrap()));
+        match &slice[0] {
+            XmlItem::Atomic(value) => assert_eq!(value, &XmlValue::integer(7.into())),
+            XmlItem::Node(_) => panic!("expected an atomic item"),
+        }
+
+        let items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![
+            XmlItem::Atomic(XmlValue::integer(1.into())),
+            XmlItem::Atomic(XmlValue::integer(2.into())),
+        ];
+        let sequence = XPathValue::from_sequence(items);
+        let slice = sequence.as_slice();
+        assert_eq!(slice.len(), 2);
+        assert!(std::ptr::eq(&slice[0], sequence.first().unwrap()));
     }
 
     #[test]

@@ -41,11 +41,19 @@ pub enum NavigatorError {
 /// | `Untyped` | No schema — atomizes to untypedAtomic |
 /// | `Nilled`  | `xsi:nil="true"` — empty sequence     |
 /// | `Absent`  | Element-only complex content (FOTY0012)|
+///
+/// A list type's typed value is one `Value` of kind
+/// [`XmlValueKind::List`](crate::types::value::XmlValueKind::List), which XPath
+/// atomization sees as one atomic value per member; an element whose complex
+/// type has empty content has an empty list as its `Value` (XDM 1.0 §6.2.4:
+/// the empty sequence).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedValue {
     /// Schema-validated typed atomic value.
     Value(XmlValue),
-    /// Untyped node (no schema) — atomizes to `xs:untypedAtomic`.
+    /// Untyped node (no schema), or an element whose complex type has mixed
+    /// content, `xs:anyType` included (XDM 1.0 §6.2.4) — atomizes to its
+    /// string value as `xs:untypedAtomic`.
     Untyped,
     /// Nilled element (`xsi:nil="true"`) — typed value is empty sequence.
     Nilled,
@@ -149,13 +157,14 @@ pub trait DomNavigator: Clone {
     /// Move to the document root
     fn move_to_root(&mut self);
 
-    /// Move to the appropriate starting position for forward document-order
-    /// traversal of the visible tree. In normal scope this is the document
-    /// root; in XSD 1.1 assertion scope it is the asserter element (the
-    /// "fragment root"), so reverse-axis iterators that need to walk forward
-    /// from the visible root stay inside the asserted subtree instead of
-    /// being blocked at the synthetic root, whose children are deliberately
-    /// hidden by `move_to_first_child`.
+    /// Move to the root of the **visible** tree. In normal scope this is the
+    /// document root; in XSD 1.1 assertion scope it is the asserter element
+    /// (the "fragment root"), whose ancestors are outside the tree the
+    /// assertion sees. Axis iterators that have to bound a traversal at the
+    /// top of the tree — `preceding`, which walks back towards it — use this
+    /// rather than `move_to_root`, so they stay inside the asserted subtree
+    /// instead of running into the synthetic root whose children are
+    /// deliberately hidden by `move_to_first_child`.
     ///
     /// Default implementation calls `move_to_root`. Implementations that
     /// support assertion scope should override.

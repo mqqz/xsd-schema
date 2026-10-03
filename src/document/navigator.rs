@@ -34,15 +34,19 @@ pub struct BufferDocNavigator<'a> {
     /// Hide the synthetic root's children for XSD assertion absolute paths.
     assertion_absolute_root: bool,
     /// In assertion scope, the asserter element (the visible "fragment root").
-    /// `NULL` outside assertion scope. Reverse axes that need a forward
-    /// document-order starting point (e.g. `preceding`) use this so they walk
-    /// inside the visible subtree instead of getting stuck at the synthetic
-    /// root, whose children `move_to_first_child` deliberately hides.
+    /// `NULL` outside assertion scope. Axis iterators that have to bound a
+    /// traversal at the top of the tree (e.g. `preceding`, which walks back
+    /// towards it) use this so they stay inside the visible subtree instead
+    /// of running into the synthetic root, whose children
+    /// `move_to_first_child` deliberately hides.
     assertion_fragment_root: u32,
     /// Non-NULL when positioned on an attribute or namespace (= owning element).
     virtual_parent: u32,
     /// Non-NULL when positioned on a namespace node.
     current_ns: NsRef,
+    /// The node this navigator presents as having no parent, or `NULL`.
+    /// See [`BufferDocNavigator::new_orphan`].
+    orphan_root: u32,
     /// Sub-index for document-order comparison of virtual nodes.
     attr_index: u16,
     /// Collected namespaces for All/ExcludeXml traversal.
@@ -57,6 +61,7 @@ impl<'a> BufferDocNavigator<'a> {
             current: node,
             assertion_absolute_root: false,
             assertion_fragment_root: NULL,
+            orphan_root: NULL,
             virtual_parent: NULL,
             current_ns: NsRef::NULL,
             attr_index: 0,
@@ -66,13 +71,86 @@ impl<'a> BufferDocNavigator<'a> {
 
     /// Creates a navigator for XSD 1.1 assertion evaluation.
     ///
-    /// The assertion context item is the asserted element, so relative paths
-    /// such as `.//x` traverse its subtree. Leading `/` and `//` are rooted at
-    /// the assertion XDM root, which exposes no synthetic child axis.
+    /// XSD 1.1 §3.13.4.1 clause 1.3 builds the assertion's data model instance
+    /// from the asserted element `E` alone: "The root node of the \[XDM\]
+    /// instance is constructed from E; the data model instance contains only
+    /// that node and nodes constructed from the \[attributes\], \[children\], and
+    /// descendants of E", with the Note "It is a consequence of this
+    /// construction that attempts to refer, in an assertion, to the siblings or
+    /// ancestors of E, or to any part of the input document outside of E
+    /// itself, will be unsuccessful."
+    ///
+    /// So the assertion context item is `E`, relative paths such as `.//x`
+    /// traverse its subtree, and every step that would leave that subtree
+    /// yields nothing: `parent::`, `ancestor::`, `ancestor-or-self::` beyond
+    /// `E`, `following-sibling::`, `preceding-sibling::`, `following::` and
+    /// `preceding::` are all cut at `E` (see
+    /// the private `is_tree_top`). For the same reason
+    /// [`find_element_by_id`](DomNavigator::find_element_by_id) — and with it
+    /// `fn:id` — answers only with an element inside `E`.
+    ///
+    /// `fn:root()` and the absolute paths built on it are the one place this
+    /// differs from [`new_orphan`](Self::new_orphan): they still land on the
+    /// document node, whose child axis is then hidden, so `/x` and `//x` select
+    /// **nothing** rather than reaching into `E`. That is what the W3C XSD 1.1
+    /// test suite requires — `ibmMeta/assertion.testSet` groups
+    /// `d4_3_15ii31` and `d4_3_15ii32`, categorised
+    /// `xsd1_1-Assertions-StayInSubtree`, are documented as
+    /// *"`//` returns empty sequence"* and expect an instance to be **invalid**
+    /// because `count(//ele1) eq 1` and `count(//@attr1) eq 1` are *false*
+    /// inside the very subtree that contains one of each.
     pub fn new_assertion(doc: &'a BufferDocument<'a>, node: u32) -> Self {
         Self {
             assertion_absolute_root: true,
             assertion_fragment_root: node,
+            ..Self::new(doc, node)
+        }
+    }
+
+    /// Creates a navigator for a node that must appear to have **no parent**.
+    ///
+    /// `BufferDocument` always has a document node at the root of the tree,
+    /// but the XDM allows a parentless element, attribute, comment,
+    /// processing-instruction or text node, and a host that constructs such
+    /// nodes has to build them somewhere. Under this constructor `node` is
+    /// that parentless node: `move_to_parent` returns `false` there,
+    /// `move_to_root` and `move_to_visible_root` land on it rather than on the
+    /// document node that physically holds it, and it has no siblings. Its
+    /// descendants behave normally and reach it with `move_to_parent`.
+    ///
+    /// So `parent::`, `ancestor::`, the sibling axes, `following::` and
+    /// `preceding::` all stop at `node`, and `fn:root()` and `..` agree that it
+    /// is the root of its own tree. The scope of an id is that tree as well:
+    /// [`find_element_by_id`](DomNavigator::find_element_by_id) answers with
+    /// the first element *inside the subtree of `node`* that has the id.
+    ///
+    /// [`new_assertion`](Self::new_assertion) cuts the same upward and
+    /// sideways links at the asserted element; the two differ only in
+    /// `fn:root()` and the absolute paths built on it, which under
+    /// `new_assertion` deliberately still reach the hidden document node (and
+    /// select nothing below it). Here `fn:root()` lands on `node`, so a leading
+    /// `/` or `//` — `fn:root(self::node()) treat as document-node()`, XPath 2.0
+    /// §3.2 — raises `XPDY0050` when `node` is not a document node.
+    ///
+    /// The document node already has no parent and no siblings, so
+    /// `new_orphan(doc, doc.root())` is the ordinary navigator
+    /// ([`new`](Self::new)).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `node` is not a node of `doc`.
+    pub fn new_orphan(doc: &'a BufferDocument<'a>, node: u32) -> Self {
+        assert!(
+            doc.has_node(node),
+            "new_orphan: {node} is not a node of this document"
+        );
+        if node == doc.root || doc.nodes.get(node).node_type() == NodeType::Root {
+            return Self::new(doc, node);
+        }
+        Self {
+            assertion_absolute_root: true,
+            assertion_fragment_root: node,
+            orphan_root: node,
             ..Self::new(doc, node)
         }
     }
@@ -99,6 +177,36 @@ impl<'a> BufferDocNavigator<'a> {
     #[inline]
     fn is_on_attribute(&self) -> bool {
         self.virtual_parent != NULL && self.current_ns.is_null()
+    }
+
+    /// Whether this cursor sits on the node that has no parent and no siblings
+    /// in the tree this navigator presents: the node declared parentless by
+    /// [`new_orphan`](Self::new_orphan), or the asserted element under
+    /// [`new_assertion`](Self::new_assertion).
+    ///
+    /// XSD 1.1 §3.13.4.1 clause 1.3 builds an assertion's data model instance
+    /// so that it "contains only that node and nodes constructed from the
+    /// [attributes], [children], and descendants of E", with the Note
+    /// "attempts to refer, in an assertion, to the siblings or ancestors of E,
+    /// … will be unsuccessful". The upward and sideways links of E are
+    /// therefore cut exactly as an orphan's are; only `fn:root()` and the
+    /// absolute paths that build on it differ between the two constructors
+    /// (see [`new_assertion`](Self::new_assertion)).
+    ///
+    /// An attribute or namespace cursor keeps `current` on its **owning
+    /// element**, so `current` equals the boundary node for that element's
+    /// attribute and namespace nodes as well as for the node itself. They are
+    /// different nodes, and the parent of such a node *is* the boundary node —
+    /// the cut applies only to the boundary node's own upward links.
+    #[inline]
+    fn is_tree_top(&self) -> bool {
+        if self.virtual_parent != NULL {
+            return false;
+        }
+        if self.orphan_root != NULL && self.current == self.orphan_root {
+            return true;
+        }
+        self.assertion_fragment_root != NULL && self.current == self.assertion_fragment_root
     }
 
     #[inline]
@@ -343,6 +451,31 @@ impl<'a> BufferDocNavigator<'a> {
                                             continue;
                                         }
                                     }
+                                    // A zero-length URI is a namespace
+                                    // *undeclaration* (`xmlns=""`). It cancels
+                                    // an outer binding — it must stay in
+                                    // `seen` so the outer one is shadowed —
+                                    // but it is the absence of a binding, so
+                                    // under `All` (the XDM
+                                    // `dm:namespace-nodes` accessor behind the
+                                    // `namespace::` axis and
+                                    // `fn:in-scope-prefixes`) no namespace
+                                    // node exists for it. `Local` and
+                                    // `ExcludeXml` are views of the
+                                    // *declarations* — serialization, shallow
+                                    // copy and the namespace context that
+                                    // resolves QNames during validation — and
+                                    // must keep it.
+                                    if scope == NamespaceAxisScope::All
+                                        && self
+                                            .doc
+                                            .names
+                                            .resolve_ref(ns_node.namespace_uri)
+                                            .is_empty()
+                                    {
+                                        ns_ref = ns_node.next;
+                                        continue;
+                                    }
                                     result.push(ns_ref);
                                 }
                                 ns_ref = ns_node.next;
@@ -565,6 +698,9 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         self.current = other.current;
         self.assertion_absolute_root = other.assertion_absolute_root;
         self.assertion_fragment_root = other.assertion_fragment_root;
+        // The parentless view travels with the cursor: landing on a node of a
+        // tree whose root is an orphan must not restore its hidden ancestors.
+        self.orphan_root = other.orphan_root;
         self.virtual_parent = other.virtual_parent;
         self.current_ns = other.current_ns;
         self.attr_index = other.attr_index;
@@ -573,6 +709,11 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
     }
 
     fn move_to_root(&mut self) {
+        if self.orphan_root != NULL {
+            self.current = self.orphan_root;
+            self.clear_virtual();
+            return;
+        }
         self.current = self.doc.root;
         self.clear_virtual();
     }
@@ -587,6 +728,13 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
     }
 
     fn move_to_parent(&mut self) -> bool {
+        // The top node's own upward link is cut, but an attribute or namespace
+        // node *of* it still has it as its parent, and such a cursor also sits
+        // on the same `current` — which `is_tree_top` accounts for, so the
+        // virtual parent is resolved below.
+        if self.is_tree_top() {
+            return false;
+        }
         if self.virtual_parent != NULL {
             self.current = self.virtual_parent;
             self.clear_virtual();
@@ -619,6 +767,9 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         if self.virtual_parent != NULL {
             return false;
         }
+        if self.is_tree_top() {
+            return false;
+        }
         let sib = self.node().next_sibling;
         if sib == NULL {
             return false;
@@ -629,6 +780,9 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
 
     fn move_to_prev_sibling(&mut self) -> bool {
         if self.virtual_parent != NULL {
+            return false;
+        }
+        if self.is_tree_top() {
             return false;
         }
         let parent_ref = self.node().parent;
@@ -974,11 +1128,29 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             None => return TypedValue::Untyped,
         };
 
-        // Complex types: only TextOnly content produces typed values
-        // (ElementOnly/Mixed/Empty never produce typed values — validator.rs:1007)
+        // Complex types (XDM 1.0 §6.2.4): simple content is validated below.
+        // "If the element has a complex type with mixed content (including
+        // xs:anyType), its typed-value is its dm:string-value as an
+        // xs:untypedAtomic"; "If the element has a complex type with empty
+        // content, its typed-value is the empty sequence" — an empty list
+        // value, which atomizes to no item; element-only content has no typed
+        // value at all (FOTY0012 on atomization).
         if let TypeKey::Complex(_) = binding.type_key {
-            if binding.content_type != Some(ContentType::TextOnly) {
-                return TypedValue::Absent;
+            match binding.content_type {
+                Some(ContentType::TextOnly) => {}
+                Some(ContentType::Mixed) => return TypedValue::Untyped,
+                Some(ContentType::Empty) => {
+                    use crate::types::value::{XmlValue, XmlValueKind};
+                    use crate::types::XmlTypeCode;
+                    return TypedValue::Value(XmlValue::new(
+                        XmlTypeCode::UntypedAtomic,
+                        XmlValueKind::List {
+                            item_type: XmlTypeCode::UntypedAtomic,
+                            items: Vec::new(),
+                        },
+                    ));
+                }
+                Some(ContentType::ElementOnly) | None => return TypedValue::Absent,
             }
         }
 
@@ -1016,11 +1188,35 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         }
     }
 
+    /// The scope of an id is one tree: the search is anchored on this cursor's
+    /// own tree (see [`BufferDocument::get_element_by_id_in_tree`] for which
+    /// nodes make up one), so a buffer holding several top-level trees never
+    /// lets one reach into another.
+    ///
+    /// Under [`new_orphan`](Self::new_orphan) and
+    /// [`new_assertion`](Self::new_assertion) the visible tree is the subtree
+    /// of the parentless node or of the asserted element `E` — XSD 1.1
+    /// §3.13.4.1 clause 1.3: the assertion's data model instance "contains
+    /// only that node and nodes constructed from the \[attributes\],
+    /// \[children\], and descendants of E". The lookup is then restricted to
+    /// that subtree *before* the first claimant is chosen, so an element
+    /// outside it is never returned and never hides one inside it.
     fn find_element_by_id(&self, id: &str) -> Result<Option<Self>, NavigatorError> {
-        Ok(self.doc.get_element_by_id(id).map(|r| {
+        let scope_root = if self.orphan_root != NULL {
+            self.orphan_root
+        } else {
+            self.assertion_fragment_root
+        };
+        let found = if scope_root != NULL {
+            self.doc.element_by_id_in_subtree(scope_root, id)
+        } else {
+            self.doc.get_element_by_id_in_tree(self.current, id)
+        };
+        Ok(found.map(|r| {
             let mut nav = BufferDocNavigator::new(self.doc, r);
             nav.assertion_absolute_root = self.assertion_absolute_root;
             nav.assertion_fragment_root = self.assertion_fragment_root;
+            nav.orphan_root = self.orphan_root;
             nav
         }))
     }
@@ -1047,6 +1243,77 @@ mod tests {
         assert!(nav.move_to_first_child()); // subElement1
         assert!(nav.move_to_first_child()); // ele2
         nav.current_ref()
+    }
+
+    /// XSD 1.1 §3.13.4.1 clause 1.3: "The root node of the [XDM] instance is
+    /// constructed from E; the data model instance contains only that node and
+    /// nodes constructed from the [attributes], [children], and descendants of
+    /// E." Note: "attempts to refer, in an assertion, to the siblings or
+    /// ancestors of E, or to any part of the input document outside of E
+    /// itself, will be unsuccessful."
+    ///
+    /// Every axis that leaves the asserted element therefore yields nothing,
+    /// and every axis inside it is unaffected.
+    #[test]
+    fn assertion_navigator_cuts_every_axis_that_leaves_the_asserted_element() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(
+            "<root><before1/><before2/><E a=\"1\"><in1/><deep><in2/></deep></E><after1/><after2/></root>",
+            &arena,
+            &names,
+        );
+        // The `E` element: third child of the document element.
+        let e = {
+            let mut nav = BufferDocNavigator::new(&doc, doc.root());
+            assert!(nav.move_to_first_child()); // root
+            assert!(nav.move_to_first_child()); // before1
+            assert!(nav.move_to_next_sibling()); // before2
+            assert!(nav.move_to_next_sibling()); // E
+            assert_eq!(nav.local_name(), "E");
+            nav.current_ref()
+        };
+        let ctx = XPathContext::new(&names);
+        let count = |expr: &str| {
+            let nav = BufferDocNavigator::new_assertion(&doc, e);
+            XPathExpr::compile(expr, &ctx)
+                .expect("compile")
+                .evaluator(&ctx)
+                .run_with_node(nav)
+                .expect("evaluate")
+                .first()
+                .and_then(|item| item.as_atomic().map(|v| v.to_string_value()))
+                .unwrap_or_default()
+        };
+
+        // Outward: nothing.
+        for expr in [
+            "count(following::node())",
+            "count(preceding::node())",
+            "count(following-sibling::node())",
+            "count(preceding-sibling::node())",
+            "count(parent::node())",
+            "count(..)",
+            "count(../..)",
+            "count(ancestor::node())",
+        ] {
+            assert_eq!(count(expr), "0", "{expr} must not leave the subtree");
+        }
+        // Inward: unchanged. `ancestor-or-self::` still has the self step.
+        assert_eq!(count("count(ancestor-or-self::node())"), "1");
+        assert_eq!(count("count(.//*)"), "3");
+        assert_eq!(count("count(descendant-or-self::node())"), "4");
+        assert_eq!(count("count(@a)"), "1");
+        assert_eq!(count("count(child::*)"), "2");
+        // An attribute of E still reaches E through its parent axis: the cut
+        // is on E's *own* upward link, not on its attributes'.
+        assert_eq!(count("count(@a/parent::E)"), "1");
+        assert_eq!(count("count(@a/../..)"), "0");
+        // A descendant reaches E, and stops there.
+        assert_eq!(count("count(deep/ancestor::*)"), "1");
+        assert_eq!(count("local-name(deep/ancestor::*)"), "E");
+        assert_eq!(count("count(in1/following::*)"), "2");
+        assert_eq!(count("count(deep/preceding::*)"), "1");
     }
 
     #[test]
@@ -1281,6 +1548,77 @@ mod tests {
             !local_uris.contains("http://example.com"),
             "inherited should not be in Local scope"
         );
+    }
+
+    #[test]
+    fn namespace_undeclaration_is_not_a_namespace_node() {
+        // `xmlns=""` is the absence of a binding for the default prefix, not a
+        // binding to the zero-length URI, so the XDM `dm:namespace-nodes`
+        // accessor (scope `All`) reports no namespace node for it — while it
+        // still shadows the outer default namespace.
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(
+            r#"<chap xmlns="http://c/"><para xmlns=""><deep/></para></chap>"#,
+            &arena,
+            &names,
+        );
+
+        let mut nav = doc.create_navigator();
+        nav.move_to_first_child(); // chap
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::All));
+        let mut chap = vec![(nav.local_name().to_string(), nav.value())];
+        while nav.move_to_next_namespace(NamespaceAxisScope::All) {
+            chap.push((nav.local_name().to_string(), nav.value()));
+        }
+        chap.sort();
+        assert_eq!(
+            chap,
+            vec![
+                (String::new(), "http://c/".to_string()),
+                (
+                    "xml".to_string(),
+                    "http://www.w3.org/XML/1998/namespace".to_string()
+                ),
+            ]
+        );
+
+        for depth in 2..=3 {
+            let mut nav = doc.create_navigator();
+            for _ in 0..depth {
+                assert!(nav.move_to_first_child());
+            }
+            assert!(nav.move_to_first_namespace(NamespaceAxisScope::All));
+            let mut seen = vec![(nav.local_name().to_string(), nav.value())];
+            while nav.move_to_next_namespace(NamespaceAxisScope::All) {
+                seen.push((nav.local_name().to_string(), nav.value()));
+            }
+            assert_eq!(
+                seen,
+                vec![(
+                    "xml".to_string(),
+                    "http://www.w3.org/XML/1998/namespace".to_string()
+                )],
+                "the undeclaration must shadow http://c/ without becoming a node (depth {depth})"
+            );
+        }
+
+        // The declaration itself is still visible to the views that model
+        // declarations rather than namespace nodes: the serializer and the
+        // namespace context that resolves QNames while validating both need
+        // `xmlns=""` to stay.
+        let mut nav = doc.create_navigator();
+        nav.move_to_first_child(); // chap
+        nav.move_to_first_child(); // para
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::Local));
+        assert_eq!((nav.local_name(), nav.value()), ("", String::new()));
+        assert!(!nav.move_to_next_namespace(NamespaceAxisScope::Local));
+
+        let mut nav = doc.create_navigator();
+        nav.move_to_first_child(); // chap
+        nav.move_to_first_child(); // para
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml));
+        assert_eq!((nav.local_name(), nav.value()), ("", String::new()));
     }
 
     // ── 4. Element value ─────────────────────────────────────────────
@@ -1577,6 +1915,182 @@ mod tests {
         let nav = doc.create_navigator();
 
         assert!(nav.find_element_by_id("missing").unwrap().is_none());
+    }
+
+    /// Evaluates `expr` with `nav` as the context node.
+    fn eval<'d>(
+        names: &NameTable,
+        nav: BufferDocNavigator<'d>,
+        expr: &str,
+    ) -> Result<crate::xpath::XPathValue<BufferDocNavigator<'d>>, crate::xpath::XPathError> {
+        let ctx = XPathContext::new(names);
+        XPathExpr::compile(expr, &ctx)
+            .expect("compile")
+            .evaluator(&ctx)
+            .run_with_node(nav)
+    }
+
+    /// The scope of an id is one *tree*. Two top-level trees in one buffer
+    /// must not see each other's ids.
+    #[test]
+    fn find_element_by_id_stays_inside_one_tree() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = crate::document::BufferDocumentBuilder::new(
+            &arena,
+            &names,
+            None,
+            crate::document::BufferDocumentOptions::fragment(),
+        )
+        .unwrap();
+        let a = builder.start_element("a", "", "", &[]).unwrap();
+        builder
+            .attribute("id", crate::namespace::table::XML_NAMESPACE, "xml", "x")
+            .unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let b = builder.start_element("b", "", "", &[]).unwrap();
+        builder
+            .attribute("id", crate::namespace::table::XML_NAMESPACE, "xml", "y")
+            .unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let doc = builder.finalize().unwrap();
+
+        let in_a = BufferDocNavigator::new_orphan(&doc, a);
+        assert!(in_a.find_element_by_id("x").unwrap().is_some(), "own tree");
+        assert!(
+            in_a.find_element_by_id("y").unwrap().is_none(),
+            "the sibling tree's id is out of scope"
+        );
+        let in_b = BufferDocNavigator::new_orphan(&doc, b);
+        assert!(in_b.find_element_by_id("y").unwrap().is_some(), "own tree");
+        assert!(
+            in_b.find_element_by_id("x").unwrap().is_none(),
+            "the sibling tree's id is out of scope"
+        );
+    }
+
+    // ── 12b. fn:id ───────────────────────────────────────────────────
+
+    /// F&O §15.5.2 with the id-index key normalized: the element's `xml:id`
+    /// has a trailing space, the argument has a leading one, and they meet.
+    #[test]
+    fn id_finds_an_element_whose_xml_id_is_padded_with_whitespace() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(
+            r#"<doc><div xml:id="id3 "><title>Expressions</title></div></doc>"#,
+            &arena,
+            &names,
+        );
+        let result =
+            eval(&names, doc.create_navigator(), "string(id(' id3')/title)").expect("evaluates");
+        assert_eq!(result.as_str().as_deref(), Some("Expressions"));
+    }
+
+    /// F&O §15.5.2: an is-id node whose value is not a lexical `xs:ID` "will
+    /// never be selected".
+    #[test]
+    fn id_never_selects_a_node_whose_xml_id_is_not_an_ncname() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(r#"<doc><a xml:id="1abc"/></doc>"#, &arena, &names);
+        let result = eval(&names, doc.create_navigator(), "count(id('1abc'))").expect("evaluates");
+        assert_eq!(result.as_f64(), Some(0.0));
+    }
+
+    /// The candidate IDREFs are `tokenize(normalize-space($s), ' ')`, and
+    /// `normalize-space` knows XML whitespace only. U+00A0 is not XML
+    /// whitespace, so `"a\u{a0}b"` is a single token — and not an NCName.
+    #[test]
+    fn id_tokenizes_on_xml_whitespace_only() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(
+            r#"<doc><a xml:id="a"/><b xml:id="b"/></doc>"#,
+            &arena,
+            &names,
+        );
+        let result =
+            eval(&names, doc.create_navigator(), "count(id('a\u{a0}b'))").expect("evaluates");
+        assert_eq!(result.as_f64(), Some(0.0));
+        // The same two names separated by real XML whitespace do select both.
+        let result =
+            eval(&names, doc.create_navigator(), "count(id(' a\t\nb '))").expect("evaluates");
+        assert_eq!(result.as_f64(), Some(2.0));
+    }
+
+    /// A token that is not an NCName is ignored, not an error, and the rest of
+    /// the token list still selects.
+    #[test]
+    fn id_ignores_a_token_that_is_not_an_ncname() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(r#"<doc><a xml:id="a"/></doc>"#, &arena, &names);
+        let result =
+            eval(&names, doc.create_navigator(), "count(id('1abc a x:y'))").expect("evaluates");
+        assert_eq!(result.as_f64(), Some(1.0));
+    }
+
+    /// F&O §15.5.2: "If the node ... is in a tree whose root is not a document
+    /// node, [err:FODC0001] is raised."
+    #[test]
+    fn id_raises_fodc0001_when_the_tree_root_is_not_a_document_node() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(r#"<doc><a xml:id="a"/></doc>"#, &arena, &names);
+        let elem = {
+            let mut nav = doc.create_navigator();
+            assert!(nav.move_to_first_child());
+            nav.current_ref()
+        };
+        let Err(err) = eval(
+            &names,
+            BufferDocNavigator::new_orphan(&doc, elem),
+            "id('a')",
+        ) else {
+            panic!("a parentless tree root is FODC0001");
+        };
+        assert_eq!(err.error_code(), Some("FODC0001"));
+    }
+
+    /// Duplicates: the first in document order wins, and it is not an error.
+    ///
+    /// The tree is built through the push API, because the text parser refuses
+    /// a duplicate `xml:id` outright (see `BufferDocumentError::DuplicateId`).
+    #[test]
+    fn id_selects_the_first_element_in_document_order() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = crate::document::BufferDocumentBuilder::new(
+            &arena,
+            &names,
+            None,
+            crate::document::BufferDocumentOptions::default(),
+        )
+        .unwrap();
+        builder.start_element("doc", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        for (name, text) in [("a", "first"), ("b", "second")] {
+            builder.start_element(name, "", "", &[]).unwrap();
+            builder
+                .attribute("id", crate::namespace::table::XML_NAMESPACE, "xml", "dup")
+                .unwrap();
+            builder.end_of_attributes();
+            builder.text(text);
+            builder.end_element().unwrap();
+        }
+        builder.end_element().unwrap();
+        let doc = builder.finalize().unwrap();
+
+        let result = eval(
+            &names,
+            doc.create_navigator(),
+            "string-join(id('dup'), '|')",
+        )
+        .expect("evaluates");
+        assert_eq!(result.as_str().as_deref(), Some("first"));
     }
 
     // ── 13. Virtual parent ───────────────────────────────────────────
@@ -1896,5 +2410,348 @@ mod tests {
                 return false;
             }
         }
+    }
+    /// `new_orphan` presents a node as the root of its own tree.
+    #[test]
+    fn an_orphan_node_has_no_parent_and_is_its_own_root() {
+        use crate::navigator::DomNavigator;
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(
+            b"<holder><kid><deep/></kid></holder>".as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+        // The element the host wants to hand out as parentless.
+        let holder = doc.root() + 1;
+        let kid = doc.first_content_child_of(holder).unwrap();
+
+        let mut nav = BufferDocNavigator::new_orphan(doc_ref(&arena, doc), kid);
+        assert_eq!(nav.local_name(), "kid");
+        assert!(!nav.move_to_parent(), "an orphan has no parent");
+        assert!(!nav.move_to_next_sibling());
+        assert!(!nav.move_to_prev_sibling());
+
+        // Its descendants are unaffected and reach it again.
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.local_name(), "deep");
+        assert!(nav.move_to_parent());
+        assert_eq!(nav.local_name(), "kid");
+
+        // fn:root() lands on the orphan, not on the document node.
+        nav.move_to_root();
+        assert_eq!(nav.local_name(), "kid");
+
+        // An ordinary navigator on the same node still sees the whole tree.
+        let mut plain = BufferDocNavigator::new(doc_ref(&arena, doc2(&arena, &names)), 0);
+        plain.move_to_root();
+        assert_eq!(plain.node_type(), DomNodeType::Root);
+    }
+
+    fn doc_ref<'a>(arena: &'a Bump, doc: BufferDocument<'a>) -> &'a BufferDocument<'a> {
+        arena.alloc(doc)
+    }
+
+    fn doc2<'a>(arena: &'a Bump, names: &'a NameTable) -> BufferDocument<'a> {
+        BufferDocument::from_reader_default(b"<a/>".as_slice(), arena, names).unwrap()
+    }
+
+    /// An orphan's *attributes and namespace nodes* keep it as their parent.
+    ///
+    /// An attribute or namespace cursor keeps `current` on the owning element,
+    /// so the naive "current == orphan_root" test also swallowed the virtual
+    /// nodes' parent link.
+    #[test]
+    fn the_virtual_nodes_of_an_orphan_still_have_it_as_their_parent() {
+        use crate::navigator::{DomNavigator, NamespaceAxisScope};
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(
+            br#"<holder><kid xmlns:p="urn:p" a="1"/></holder>"#.as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+        let doc = doc_ref(&arena, doc);
+        let holder = doc.root() + 1;
+        let kid = doc.first_content_child_of(holder).unwrap();
+
+        // The attribute axis.
+        let mut nav = BufferDocNavigator::new_orphan(doc, kid);
+        assert!(nav.move_to_first_attribute());
+        assert_eq!(nav.local_name(), "a");
+        assert!(
+            nav.move_to_parent(),
+            "an attribute of an orphan has a parent"
+        );
+        assert_eq!(nav.local_name(), "kid");
+        assert!(!nav.move_to_parent(), "and above it the tree still ends");
+
+        // The namespace axis. `local_name()` of a namespace node is its prefix.
+        let mut nav = BufferDocNavigator::new_orphan(doc, kid);
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml));
+        assert_eq!(nav.local_name(), "p");
+        assert_eq!(nav.node_type(), DomNodeType::Namespace);
+        assert!(
+            nav.move_to_parent(),
+            "a namespace node of an orphan has a parent"
+        );
+        assert_eq!(nav.local_name(), "kid");
+
+        // The ancestor axis of a namespace node is exactly the orphan.
+        let mut nav = BufferDocNavigator::new_orphan(doc, kid);
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml));
+        let mut ancestors = Vec::new();
+        while nav.move_to_parent() {
+            ancestors.push(nav.local_name().to_string());
+        }
+        assert_eq!(ancestors, vec!["kid".to_string()]);
+
+        // root() of a namespace node of an orphan is the orphan, not the
+        // document node that physically holds it.
+        let mut nav = BufferDocNavigator::new_orphan(doc, kid);
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml));
+        nav.move_to_root();
+        assert_eq!(nav.node_type(), DomNodeType::Element);
+        assert_eq!(nav.local_name(), "kid");
+    }
+
+    /// The parentless view travels with `move_to`.
+    #[test]
+    fn move_to_carries_the_orphan_view() {
+        use crate::navigator::DomNavigator;
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(
+            b"<holder><kid><deep/></kid></holder>".as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+        let doc = doc_ref(&arena, doc);
+        let holder = doc.root() + 1;
+        let kid = doc.first_content_child_of(holder).unwrap();
+
+        let orphan = BufferDocNavigator::new_orphan(doc, kid);
+        let mut cursor = doc.create_navigator();
+        assert!(cursor.move_to(&orphan));
+        assert!(
+            !cursor.move_to_parent(),
+            "move_to must carry the cut upward link"
+        );
+    }
+
+    // ── 16. The scope of fn:id under new_assertion / new_orphan ──────
+
+    /// Builds `<outer><sib xml:id=SIB/><inner>[<leaf xml:id=LEAF/>]</inner></outer>`
+    /// in a `Fragment` buffer, as the validator's assertion builder does, and
+    /// returns the document with the `inner` element.
+    fn assertion_fragment<'a>(
+        arena: &'a Bump,
+        names: &'a NameTable,
+        sib: Option<&str>,
+        leaf: Option<&str>,
+    ) -> (&'a BufferDocument<'a>, u32) {
+        use crate::namespace::table::XML_NAMESPACE;
+        let mut builder = crate::document::BufferDocumentBuilder::new(
+            arena,
+            names,
+            None,
+            crate::document::BufferDocumentOptions::fragment(),
+        )
+        .unwrap();
+        builder.start_element("outer", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.start_element("sib", "", "", &[]).unwrap();
+        if let Some(id) = sib {
+            builder.attribute("id", XML_NAMESPACE, "xml", id).unwrap();
+        }
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let inner = builder.start_element("inner", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        if let Some(id) = leaf {
+            builder.start_element("leaf", "", "", &[]).unwrap();
+            builder.attribute("id", XML_NAMESPACE, "xml", id).unwrap();
+            builder.end_of_attributes();
+            builder.end_element().unwrap();
+        }
+        builder.end_element().unwrap();
+        builder.end_element().unwrap();
+        (arena.alloc(builder.finalize().unwrap()), inner)
+    }
+
+    /// XSD 1.1 §3.13.4.1 clause 1.3: the assertion's data model instance
+    /// "contains only that node and nodes constructed from the \[attributes\],
+    /// \[children\], and descendants of E" — so `fn:id` inside an assertion
+    /// must not find an element outside the asserted element, here its
+    /// preceding sibling.
+    #[test]
+    fn id_in_an_assertion_does_not_reach_outside_the_asserted_element() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let (doc, inner) = assertion_fragment(&arena, &names, Some("x"), None);
+        let result = eval(
+            &names,
+            BufferDocNavigator::new_assertion(doc, inner),
+            "empty(id('x'))",
+        )
+        .expect("evaluates");
+        assert_eq!(result.as_bool(), Some(true), "the sibling is outside E");
+        assert!(BufferDocNavigator::new_assertion(doc, inner)
+            .find_element_by_id("x")
+            .unwrap()
+            .is_none());
+        // The same lookup from the outer element, whose subtree holds `sib`.
+        let outer = doc.root() + 1;
+        let found = BufferDocNavigator::new_assertion(doc, outer)
+            .find_element_by_id("x")
+            .unwrap()
+            .expect("inside the outer element");
+        assert_eq!(found.local_name(), "sib");
+    }
+
+    /// An element inside the asserted element is found, even when an element
+    /// outside it — earlier in document order — claims the same value: the
+    /// restricted lookup answers with the first claimant *inside* the subtree,
+    /// not with the first claimant of the buffer filtered afterwards.
+    #[test]
+    fn id_in_an_assertion_finds_the_first_claimant_inside_the_asserted_element() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let (doc, inner) = assertion_fragment(&arena, &names, Some("k"), Some("k"));
+        let found = BufferDocNavigator::new_assertion(doc, inner)
+            .find_element_by_id("k")
+            .unwrap()
+            .expect("the leaf inside E claims k");
+        assert_eq!(found.local_name(), "leaf");
+        let result = eval(
+            &names,
+            BufferDocNavigator::new_assertion(doc, inner),
+            "string(name(id('k')))",
+        )
+        .expect("evaluates");
+        assert_eq!(result.as_str().as_deref(), Some("leaf"));
+    }
+
+    /// The same for a parentless node: the orphan's own tree holds `inside`,
+    /// and an earlier `outside` with the same id must not hide it.
+    #[test]
+    fn an_orphan_finds_the_first_claimant_inside_its_own_tree() {
+        use crate::namespace::table::XML_NAMESPACE;
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = crate::document::BufferDocumentBuilder::new(
+            &arena,
+            &names,
+            None,
+            crate::document::BufferDocumentOptions::default(),
+        )
+        .unwrap();
+        builder.start_element("holder", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.start_element("outside", "", "", &[]).unwrap();
+        builder.attribute("id", XML_NAMESPACE, "xml", "k").unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let kid = builder.start_element("kid", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        let inside = builder.start_element("inside", "", "", &[]).unwrap();
+        builder.attribute("id", XML_NAMESPACE, "xml", "k").unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        builder.end_element().unwrap();
+        builder.end_element().unwrap();
+        let doc = builder.finalize().unwrap();
+
+        let found = BufferDocNavigator::new_orphan(&doc, kid)
+            .find_element_by_id("k")
+            .unwrap()
+            .expect("inside is in the orphan's tree");
+        assert_eq!(found.current_ref(), inside);
+        // The hit keeps the parentless view.
+        let mut up = found.clone();
+        assert!(up.move_to_parent());
+        assert_eq!(up.current_ref(), kid);
+        assert!(!up.move_to_parent(), "the orphan is still the top");
+    }
+
+    /// A parentless text, comment or attribute node holds no element, so no id
+    /// lookup from it can succeed — even though the range of nodes after an
+    /// attribute runs into its owner's children.
+    #[test]
+    fn a_parentless_attribute_finds_no_id() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(
+            r#"<holder a="1"><kid xml:id="k"/></holder>"#,
+            &arena,
+            &names,
+        );
+        let holder = doc.root() + 1;
+        let attr = holder + 1;
+        assert_eq!(doc.nodes.get(attr).node_type(), NodeType::Attribute);
+        assert!(BufferDocNavigator::new_orphan(&doc, attr)
+            .find_element_by_id("k")
+            .unwrap()
+            .is_none());
+    }
+
+    /// `new_orphan` on the document node: the document node has no parent and
+    /// no siblings already, so the parentless view is the ordinary one and
+    /// must not hide the document's children.
+    #[test]
+    fn new_orphan_on_the_document_node_is_the_ordinary_navigator() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc("<r><x/></r>", &arena, &names);
+        let mut nav = BufferDocNavigator::new_orphan(&doc, doc.root());
+        assert!(!nav.move_to_parent());
+        assert!(nav.move_to_first_child(), "the document element is visible");
+        assert_eq!(nav.local_name(), "r");
+        for (expr, expected) in [
+            ("count(*)", 1.0),
+            ("count(node())", 1.0),
+            ("count(descendant::x)", 1.0),
+            ("count(/r)", 1.0),
+            ("count(root()/r/x)", 1.0),
+        ] {
+            let result = eval(
+                &names,
+                BufferDocNavigator::new_orphan(&doc, doc.root()),
+                expr,
+            )
+            .expect("evaluates");
+            assert_eq!(result.as_f64(), Some(expected), "{expr}");
+        }
+    }
+
+    /// A reference that is not a node of the document is a caller error,
+    /// reported at once rather than on first use.
+    #[test]
+    #[should_panic(expected = "not a node of this document")]
+    fn new_orphan_panics_on_a_node_reference_out_of_range() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc("<r/>", &arena, &names);
+        let _ = BufferDocNavigator::new_orphan(&doc, doc.nodes.len());
+    }
+
+    /// In a `Full` document the whole document is one tree, so a cursor on a
+    /// top-level comment finds the ids of the document element.
+    #[test]
+    fn find_element_by_id_from_a_top_level_comment() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(r#"<!--c--><?pi x?><r><a xml:id="x"/></r>"#, &arena, &names);
+        let mut nav = doc.create_navigator();
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.node_type(), DomNodeType::Comment);
+        let found = nav
+            .find_element_by_id("x")
+            .unwrap()
+            .expect("same document, same tree");
+        assert_eq!(found.local_name(), "a");
     }
 }

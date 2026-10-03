@@ -20,7 +20,7 @@ use crate::types::XmlTypeCode;
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::iterator::XmlItem;
-use crate::xpath::{DomNavigator, DomNodeType};
+use crate::xpath::{DomNavigator, DomNodeType, TypedValue};
 
 use super::{atomize_to_string_opt, materialize, XPathValue};
 
@@ -194,26 +194,15 @@ pub fn nilled<N: DomNavigator>(
     };
 
     match node.node_type() {
-        DomNodeType::Element => {
-            // Check for xsi:nil attribute
-            let mut nav = node.clone();
-            if nav.move_to_first_attribute() {
-                loop {
-                    if nav.local_name() == "nil"
-                        && nav.namespace_uri() == "http://www.w3.org/2001/XMLSchema-instance"
-                    {
-                        let value = nav.value();
-                        let is_nilled = value == "true" || value == "1";
-                        return Ok(XPathValue::boolean(is_nilled));
-                    }
-                    if !nav.move_to_next_attribute() {
-                        break;
-                    }
-                }
-            }
-            // No xsi:nil attribute found
-            Ok(XPathValue::boolean(false))
-        }
+        // "nilled" is the post-schema-validation property of the same name,
+        // not the presence of an `xsi:nil` attribute: an element that was
+        // never validated against a schema is not nilled, whatever attributes
+        // it carries. The navigator reports the property through
+        // `TypedValue::Nilled`, which only a validated nilled element has.
+        DomNodeType::Element => Ok(XPathValue::boolean(matches!(
+            node.typed_value(),
+            TypedValue::Nilled
+        ))),
         _ => Ok(XPathValue::Empty),
     }
 }
@@ -387,10 +376,13 @@ pub fn root<N: DomNavigator>(
 /// If 1 arg: uses context item as reference node.
 /// If 2 args: second arg is the reference node.
 ///
-/// The reference node determines which document tree to search.
-/// Each string argument is tokenized by whitespace and each token
-/// is looked up via `find_element_by_id`. Results are deduplicated
-/// and returned in document order.
+/// The reference node determines which tree to search: F&O §15.5.2 selects
+/// the elements of the tree containing `$node`, and raises `FODC0001` when
+/// that tree's root is not a document node. The candidate IDREF values are
+/// `for $s in $arg return tokenize(normalize-space($s), ' ')[. castable as
+/// xs:IDREF]`, so tokenization is on XML whitespace and a token that is not
+/// an NCName is ignored — with no error for one that matches nothing.
+/// Results are deduplicated and returned in document order.
 ///
 /// Without DTD/schema ID declarations, the default `find_element_by_id`
 /// returns `None`, so this returns an empty sequence.
@@ -444,9 +436,18 @@ pub fn id<N: DomNavigator>(
         }
     };
 
-    // Navigate reference node to document root
+    // Navigate reference node to the root of its tree. F&O §15.5.2: "If the
+    // node ... is in a tree whose root is not a document node [err:FODC0001]
+    // is raised."
     let mut root_nav = ref_node;
     root_nav.move_to_root();
+    if root_nav.node_type() != DomNodeType::Root {
+        return Err(XPathError::raised(
+            crate::xpath::error::XQT_ERRORS_NAMESPACE,
+            "FODC0001",
+            Some("fn:id: the node is in a tree whose root is not a document node"),
+        ));
+    }
 
     // Collect all ID tokens from the first argument
     let id_arg = args.into_iter().next().unwrap();
@@ -475,26 +476,34 @@ pub fn id<N: DomNavigator>(
     Ok(XPathValue::from_sequence(items))
 }
 
-/// Collect whitespace-tokenized ID strings from an XPathValue argument.
+/// Collect the candidate IDREF values of an `fn:id` argument.
 ///
-/// Per the spec, each string value in the argument is split on whitespace
-/// and each resulting token is an IDREF to look up.
+/// F&O §15.5.2 defines them as `for $s in $arg return
+/// tokenize(normalize-space($s), ' ')[. castable as xs:IDREF]`: each string is
+/// a whitespace-separated token list, tokenized on **XML** whitespace (which
+/// is what `normalize-space` knows — not `char::is_whitespace`), and a token
+/// that is not a lexical NCName is dropped rather than looked up.
 fn collect_id_tokens<N: DomNavigator>(value: XPathValue<N>) -> Vec<String> {
+    /// XML whitespace: space, tab, carriage return, line feed.
+    fn is_xml_space(c: char) -> bool {
+        matches!(c, ' ' | '\t' | '\r' | '\n')
+    }
+
+    fn push_tokens(s: &str, tokens: &mut Vec<String>) {
+        tokens.extend(
+            s.split(is_xml_space)
+                .filter(|token| crate::namespace::is_ncname(token))
+                .map(str::to_string),
+        );
+    }
+
     let mut tokens = Vec::new();
     match value {
         XPathValue::Empty => {}
-        XPathValue::Item(item) => {
-            let s = item_string_value(item);
-            for token in s.split_whitespace() {
-                tokens.push(token.to_string());
-            }
-        }
+        XPathValue::Item(item) => push_tokens(&item_string_value(item), &mut tokens),
         XPathValue::Sequence(items) => {
             for item in items {
-                let s = item_string_value(item);
-                for token in s.split_whitespace() {
-                    tokens.push(token.to_string());
-                }
+                push_tokens(&item_string_value(item), &mut tokens);
             }
         }
     }
@@ -545,35 +554,41 @@ fn get_opt_id(names: &NameTable, s: &str) -> Option<NameId> {
     }
 }
 
-/// Get a node argument, using context item if no argument provided.
-/// Returns None for empty sequence.
+/// Get a `$arg as node()?` argument, using the context item if no argument is
+/// provided. Returns None for the empty sequence.
+///
+/// F&O (e.g. §14.1 `fn:name`): "If the argument is omitted, it defaults to the
+/// context item (.). … The following errors may be raised: if the context item
+/// is undefined \[err:XPDY0002\]; if the context item is not a node
+/// \[err:XPTY0004\]." A supplied argument that is not a `node()?` — an atomic
+/// value, or more than one item — fails the function conversion rules (XPath
+/// 2.0 §3.1.5), which is XPTY0004 as well.
 fn get_node_arg<N: DomNavigator>(
     context: &DynamicContext<'_, N>,
     args: Vec<XPathValue<N>>,
 ) -> Result<Option<N>, XPathError> {
+    let not_a_node = || XPathError::XPTY0004 {
+        expected: "node()?".to_string(),
+        found: "an atomic value".to_string(),
+    };
     if args.is_empty() {
         // Use context item
         match &context.context_item {
             Some(XmlItem::Node(n)) => Ok(Some(n.clone())),
-            Some(XmlItem::Atomic(_)) => {
-                // Non-node context item returns empty for these functions
-                Ok(None)
-            }
+            Some(XmlItem::Atomic(_)) => Err(not_a_node()),
             None => Err(XPathError::XPDY0002 {
                 message: "Context item is absent".to_string(),
             }),
         }
     } else {
-        let items = materialize(args.into_iter().next().unwrap());
-        if items.is_empty() {
-            return Ok(None);
+        let mut items = materialize(args.into_iter().next().unwrap());
+        if items.len() > 1 {
+            return Err(super::too_many_items("node()?"));
         }
-        match &items[0] {
-            XmlItem::Node(n) => Ok(Some(n.clone())),
-            XmlItem::Atomic(_) => {
-                // Non-node returns empty for these functions
-                Ok(None)
-            }
+        match items.pop() {
+            None => Ok(None),
+            Some(XmlItem::Node(n)) => Ok(Some(n)),
+            Some(XmlItem::Atomic(_)) => Err(not_a_node()),
         }
     }
 }
@@ -588,10 +603,20 @@ fn compute_base_uri<N: DomNavigator>(node: &N, static_base_uri: Option<&str>) ->
     let mut xml_bases: Vec<String> = Vec::new();
     let mut nav = node.clone();
 
-    // For text, comment, PI nodes, start from parent
+    // A namespace node has no base URI of its own and does not inherit one:
+    // the XDM accessor is the empty sequence for it.
+    if nav.node_type() == DomNodeType::Namespace {
+        return None;
+    }
+
+    // An attribute, text, comment or processing-instruction node has the base
+    // URI of its parent element, and none at all when it has no parent — an
+    // `xml:base` on the attribute's own owner is what it inherits, never one
+    // it carries itself.
     if matches!(
         nav.node_type(),
-        DomNodeType::Text
+        DomNodeType::Attribute
+            | DomNodeType::Text
             | DomNodeType::Whitespace
             | DomNodeType::SignificantWhitespace
             | DomNodeType::Comment
@@ -911,5 +936,62 @@ mod tests {
             matches!(result, super::super::XPathValue::Empty),
             "Expected empty sequence from fn:id without DTD"
         );
+    }
+    // =========================================================================
+    // dm:base-uri per node kind
+    // =========================================================================
+
+    /// The XDM base-uri accessor differs by node kind: an attribute, text,
+    /// comment or processing-instruction node inherits its parent element's
+    /// base URI and has none without a parent, and a namespace node has none
+    /// at all.
+    #[test]
+    fn base_uri_follows_the_xdm_accessor_rules() {
+        use crate::xpath::RoXmlNavigator;
+
+        let xml = r#"<r xmlns:p="http://p/" a="v" xml:base="sub/"><c/><!--k--><?pi d?>t</r>"#;
+        let doc = roxmltree::Document::parse(xml).unwrap();
+        let base = "http://example.com/dir/doc.xml";
+
+        let root = RoXmlNavigator::with_base_uri(&doc, base);
+        let mut element = root.clone();
+        assert!(element.move_to_first_child());
+
+        // The element's own xml:base resolves against the document's.
+        let element_base = compute_base_uri(&element, Some(base));
+        assert_eq!(
+            element_base.as_deref(),
+            Some("http://example.com/dir/sub/"),
+            "element"
+        );
+
+        // An attribute has its parent element's base URI, not one of its own.
+        let mut attribute = element.clone();
+        assert!(attribute.move_to_first_attribute());
+        assert_eq!(
+            compute_base_uri(&attribute, Some(base)),
+            element_base,
+            "attribute"
+        );
+
+        // A namespace node has none.
+        let mut namespace = element.clone();
+        assert!(namespace.move_to_first_namespace(crate::navigator::NamespaceAxisScope::All));
+        assert_eq!(compute_base_uri(&namespace, Some(base)), None, "namespace");
+
+        // The child element, the comment, the PI and the text all inherit it.
+        let mut child = element.clone();
+        assert!(child.move_to_first_child());
+        loop {
+            assert_eq!(
+                compute_base_uri(&child, Some(base)),
+                element_base,
+                "{:?}",
+                child.node_type()
+            );
+            if !child.move_to_next_sibling() {
+                break;
+            }
+        }
     }
 }

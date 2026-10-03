@@ -6,6 +6,8 @@
 //! - `VarStore` - Variable storage (Vec-based arena indexed by VarSlotId)
 //! - `NameBinder` - Compile-time variable slot allocation
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::ids::NameId;
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::QualifiedName;
@@ -13,6 +15,7 @@ use crate::namespace::table::NameTable;
 use crate::schema::SchemaSet;
 use crate::types::value::{DateTimeValue, TimezoneOffset};
 
+use super::collation::CollationResolver;
 use super::functions::{BuiltinCatalog, BuiltinEvaluator, FunctionCatalog, FunctionEvaluator};
 use super::iterator::XmlItem;
 use super::DomNavigator;
@@ -58,6 +61,21 @@ pub struct XPathContext<'a> {
     /// Takes precedence over the `default_function_ns` field when set; see
     /// [`default_function_namespace`](Self::default_function_namespace).
     default_function_ns_owned: Option<String>,
+    /// XPath 1.0 compatibility mode, set by
+    /// [`with_xpath10_compatibility`](Self::with_xpath10_compatibility).
+    xpath10_compatibility: bool,
+    /// Host collations, set by
+    /// [`with_collation_resolver`](Self::with_collation_resolver). `None` means
+    /// the codepoint collation is the only one this context supports.
+    collation_resolver: Option<&'a dyn CollationResolver>,
+    /// The static context's *default collation* property, set by
+    /// [`with_default_collation`](Self::with_default_collation).
+    ///
+    /// `None` is the codepoint collation, and the codepoint URI is normalised
+    /// to `None` when it is set explicitly — so every hot path decides "is the
+    /// default collation the codepoint one" with a discriminant test and never
+    /// a string comparison.
+    default_collation: Option<String>,
 }
 
 impl<'a> XPathContext<'a> {
@@ -75,6 +93,9 @@ impl<'a> XPathContext<'a> {
             trace_enabled: false,
             function_catalog: None,
             default_function_ns_owned: None,
+            xpath10_compatibility: false,
+            collation_resolver: None,
+            default_collation: None,
         }
     }
 
@@ -165,6 +186,66 @@ impl<'a> XPathContext<'a> {
         self
     }
 
+    /// Turn *XPath 1.0 compatibility mode* on or off.
+    ///
+    /// This is the static-context property XPath 2.0 calls "XPath 1.0
+    /// compatibility mode", and it is **not** the same thing as
+    /// [`XPathMode::XPath10`]. The mode selects the *language*: its lexer and
+    /// parser reject XPath 2.0 syntax outright (sequence expressions, `for`,
+    /// `instance of`, double literals, …). The flag set here keeps the full
+    /// XPath 2.0 syntax and changes only the *semantics* that XPath 2.0 itself
+    /// defines differently when the flag is true:
+    ///
+    /// * the operands of `+`, `-`, `*`, `div` and `mod` are converted with the
+    ///   1.0 number rules;
+    /// * general comparisons (`=`, `!=`, `<`, …) follow the compatibility
+    ///   rules of XPath 2.0 §3.5.2: an operand compared with a single boolean is
+    ///   converted to its effective boolean value, and `<`, `<=`, `>`, `>=`
+    ///   compare with `fn:number`;
+    /// * an argument whose declared type is a single item takes the first item
+    ///   of the supplied sequence (the function conversion rules of §3.1.5).
+    ///
+    /// The effective boolean value itself is not affected: a sequence of two or
+    /// more atomic values is `FORG0006` with the flag as without it (§2.4.3).
+    ///
+    /// Hosts embedding the XPath engine need this when they must run
+    /// expressions written for a 1.0-era host language while still accepting
+    /// 2.0 syntax in the same document. Setting
+    /// [`with_mode`](Self::with_mode) to [`XPathMode::XPath10`] implies these
+    /// semantics as well, so the flag is only meaningful in
+    /// [`XPathMode::XPath20`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use xsd_schema::namespace::table::NameTable;
+    /// use xsd_schema::xpath::{RoXmlNavigator, XPathContext, XPathExpr};
+    ///
+    /// let names = NameTable::new();
+    /// let ctx = XPathContext::new(&names).with_xpath10_compatibility(true);
+    ///
+    /// // 2.0 syntax still parses …
+    /// let expr = XPathExpr::compile("(1, 2, 3)[1]", &ctx).unwrap();
+    /// // … while `1 div 0` follows the 1.0 rule of yielding INF, not an error.
+    /// let inf = XPathExpr::compile("1 div 0", &ctx).unwrap();
+    /// let value = inf.evaluator(&ctx).run_number::<RoXmlNavigator<'static>>().unwrap();
+    /// assert!(value.is_infinite());
+    /// let _ = expr;
+    /// ```
+    pub fn with_xpath10_compatibility(mut self, enabled: bool) -> Self {
+        self.xpath10_compatibility = enabled;
+        self
+    }
+
+    /// Whether *XPath 1.0 compatibility mode* is on — either because
+    /// [`with_xpath10_compatibility`](Self::with_xpath10_compatibility) set it
+    /// or because the language mode is [`XPathMode::XPath10`], which implies
+    /// it.
+    #[inline]
+    pub fn xpath10_compatibility(&self) -> bool {
+        self.xpath10_compatibility || self.mode == XPathMode::XPath10
+    }
+
     /// Get the XPath language mode.
     pub fn mode(&self) -> XPathMode {
         self.mode
@@ -182,6 +263,77 @@ impl<'a> XPathContext<'a> {
     pub fn function_catalog(&self) -> &dyn FunctionCatalog {
         static BUILTIN: BuiltinCatalog = BuiltinCatalog;
         self.function_catalog.unwrap_or(&BUILTIN)
+    }
+
+    /// Install the host's collations.
+    ///
+    /// Without a resolver the only collation this context supports is the
+    /// Unicode codepoint collation
+    /// ([`CODEPOINT_COLLATION_URI`](crate::xpath::collation::CODEPOINT_COLLATION_URI)),
+    /// and every other collation URI is `FOCH0002` where it is used. With one,
+    /// the `$collation` argument of `fn:compare`, `fn:contains`,
+    /// `fn:starts-with`, `fn:ends-with`, `fn:substring-before`,
+    /// `fn:substring-after`, `fn:index-of`, `fn:distinct-values`,
+    /// `fn:deep-equal`, `fn:min` and `fn:max` — and the default collation set by
+    /// [`with_default_collation`](Self::with_default_collation) — are looked up
+    /// through it.
+    ///
+    /// The resolver is never asked about the codepoint URI, which this crate
+    /// implements itself, and it is asked only when a collation is needed to
+    /// compare strings, so an expression that compares none never reaches it.
+    ///
+    /// See [`collation`](crate::xpath::collation) for a worked example.
+    pub fn with_collation_resolver(mut self, resolver: &'a dyn CollationResolver) -> Self {
+        self.collation_resolver = Some(resolver);
+        self
+    }
+
+    /// Set the static context's *default collation* property.
+    ///
+    /// This is the collation the value and general comparisons (`eq`, `lt`,
+    /// `=`, `<`, …) use for strings, and the one every collation-aware function
+    /// uses when it is called without a `$collation` argument. It is also what
+    /// `fn:default-collation()` returns. Unset, it is the Unicode codepoint
+    /// collation.
+    ///
+    /// The URI is taken as given: XPath 2.0 §2.1.1 makes the default collation a
+    /// static-context property that is already an absolute URI, so — unlike a
+    /// `$collation` *argument* — it is not resolved against the base URI. It is
+    /// not validated here either: an unsupported default collation raises
+    /// `FOCH0002` where a string comparison needs it, and never disturbs an
+    /// expression that compares no strings.
+    pub fn with_default_collation(mut self, uri: impl Into<String>) -> Self {
+        let uri = uri.into();
+        // The codepoint collation is the absence of a default collation, so
+        // that the hot paths never compare this URI at all.
+        self.default_collation =
+            (uri != crate::xpath::collation::CODEPOINT_COLLATION_URI).then_some(uri);
+        self
+    }
+
+    /// The static context's default collation URI — the codepoint collation
+    /// when [`with_default_collation`](Self::with_default_collation) has not
+    /// set another one.
+    pub fn default_collation(&self) -> &str {
+        self.default_collation
+            .as_deref()
+            .unwrap_or(crate::xpath::collation::CODEPOINT_COLLATION_URI)
+    }
+
+    /// The default collation URI, or `None` when it is the codepoint collation.
+    ///
+    /// The internal counterpart of [`default_collation`](Self::default_collation):
+    /// `None` is the answer the comparison paths want, because it needs no
+    /// resolution at all.
+    #[inline]
+    pub(crate) fn default_collation_uri(&self) -> Option<&str> {
+        self.default_collation.as_deref()
+    }
+
+    /// The host's collation resolver, if one was installed.
+    #[inline]
+    pub(crate) fn collation_resolver(&self) -> Option<&'a dyn CollationResolver> {
+        self.collation_resolver
     }
 
     /// Resolve a prefix to a namespace URI.
@@ -393,10 +545,32 @@ impl NameBinder {
 ///
 /// Stores variable values indexed by VarSlotId.
 /// Size is determined by NameBinder::len() after binding.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VarStore<V> {
     /// Variable values indexed by slot ID
     values: Vec<Option<V>>,
+    /// How often each slot has been written. A consumer that caches something
+    /// derived from a slot's value uses this to notice a rebinding in O(1),
+    /// whatever the new value happens to be allocated at; see
+    /// [`generation`](Self::generation).
+    generations: Vec<u64>,
+    /// Which store the generations count in; see [`serial`](Self::serial).
+    serial: u64,
+}
+
+/// Source of [`VarStore::serial`].
+static NEXT_VAR_STORE_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+impl<V: Clone> Clone for VarStore<V> {
+    /// A clone is written independently of the original, so its generations
+    /// count in a store of their own.
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            generations: self.generations.clone(),
+            serial: NEXT_VAR_STORE_SERIAL.fetch_add(1, Ordering::Relaxed),
+        }
+    }
 }
 
 impl<V> VarStore<V> {
@@ -406,7 +580,23 @@ impl<V> VarStore<V> {
     pub fn new(size: usize) -> Self {
         let mut values = Vec::with_capacity(size);
         values.resize_with(size, || None);
-        Self { values }
+        Self {
+            values,
+            generations: vec![0; size],
+            serial: NEXT_VAR_STORE_SERIAL.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// A number no other store — live or dropped — carries.
+    ///
+    /// Generations count writes *within one store*, so two stores can show the
+    /// same generation for a slot that holds different values. A consumer that
+    /// remembers a generation remembers this serial with it: replacing the
+    /// store of a [`DynamicContext`] (its `variables` field is public), by a new
+    /// store or by a clone, then never looks like "nothing was written".
+    #[inline]
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// Get a variable value by slot ID.
@@ -418,6 +608,7 @@ impl<V> VarStore<V> {
     pub fn set(&mut self, slot: VarSlotId, value: V) {
         if let Some(cell) = self.values.get_mut(slot as usize) {
             *cell = Some(value);
+            self.bump(slot);
         }
     }
 
@@ -425,6 +616,7 @@ impl<V> VarStore<V> {
     pub fn clear_slot(&mut self, slot: VarSlotId) {
         if let Some(cell) = self.values.get_mut(slot as usize) {
             *cell = None;
+            self.bump(slot);
         }
     }
 
@@ -432,6 +624,27 @@ impl<V> VarStore<V> {
     pub fn clear(&mut self) {
         for cell in &mut self.values {
             *cell = None;
+        }
+        for generation in &mut self.generations {
+            *generation = generation.wrapping_add(1);
+        }
+    }
+
+    /// How often `slot` has been written since the store was created.
+    ///
+    /// Every write goes through [`set`](Self::set), [`clear_slot`](Self::clear_slot)
+    /// or [`clear`](Self::clear), and the store hands out no mutable reference to a
+    /// value, so an unchanged generation means the slot still holds the very value
+    /// it held when the generation was read.
+    #[inline]
+    pub(crate) fn generation(&self, slot: VarSlotId) -> u64 {
+        self.generations.get(slot as usize).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn bump(&mut self, slot: VarSlotId) {
+        if let Some(generation) = self.generations.get_mut(slot as usize) {
+            *generation = generation.wrapping_add(1);
         }
     }
 
@@ -487,6 +700,23 @@ pub struct DynamicContext<'a, N: DomNavigator> {
     ///
     /// See [`with_extension`](Self::with_extension).
     extension: Option<&'a dyn std::any::Any>,
+    /// General-comparison indexes reused across evaluations of one comparison
+    /// node during this run; see
+    /// [`compare_cache`](crate::xpath::compare_cache). Empty and
+    /// allocation-free until the first general comparison is evaluated, and
+    /// dropped with the context.
+    compare_cache: crate::xpath::compare_cache::GeneralCompareCache,
+    /// Compiled regular expressions reused across the `fn:matches`,
+    /// `fn:replace` and `fn:tokenize` calls of this run; see
+    /// [`regex_cache`](crate::xpath::regex_cache). Empty and allocation-free
+    /// until the first such call, and dropped with the context.
+    regex_cache: crate::xpath::regex_cache::RegexCache,
+    /// Collations resolved through the host's
+    /// [`CollationResolver`](crate::xpath::collation::CollationResolver) during
+    /// this run; see [`collation`](crate::xpath::collation). Empty and
+    /// allocation-free unless a non-codepoint collation is used, and dropped
+    /// with the context.
+    collation_cache: crate::xpath::collation::CollationCache,
 }
 
 impl<'a, N: DomNavigator> DynamicContext<'a, N> {
@@ -505,6 +735,9 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
             variables: VarStore::new(var_count),
             function_evaluator: None,
             extension: None,
+            compare_cache: Default::default(),
+            regex_cache: Default::default(),
+            collation_cache: Default::default(),
         }
     }
 
@@ -562,9 +795,99 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
         }
     }
 
+    /// The general-comparison index cache of this run.
+    #[inline]
+    pub(crate) fn general_compare_cache(
+        &self,
+    ) -> &crate::xpath::compare_cache::GeneralCompareCache {
+        &self.compare_cache
+    }
+
+    /// The general-comparison index cache of this run, mutably.
+    #[inline]
+    pub(crate) fn general_compare_cache_mut(
+        &mut self,
+    ) -> &mut crate::xpath::compare_cache::GeneralCompareCache {
+        &mut self.compare_cache
+    }
+
+    /// The compiled regular expressions of this run.
+    #[inline]
+    pub(crate) fn regex_cache_mut(&mut self) -> &mut crate::xpath::regex_cache::RegexCache {
+        &mut self.regex_cache
+    }
+
+    /// The compiled regular expressions of this run. Test-only: the shipped
+    /// path never reads the cache without also being allowed to fill it.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn regex_cache(&self) -> &crate::xpath::regex_cache::RegexCache {
+        &self.regex_cache
+    }
+
+    /// The collations resolved during this run.
+    #[inline]
+    pub(crate) fn collation_cache_mut(&mut self) -> &mut crate::xpath::collation::CollationCache {
+        &mut self.collation_cache
+    }
+
+    /// The static context's default collation for one comparison: resolved —
+    /// through this run's memo — only when that comparison actually compares
+    /// two strings. See [`DeferredDefault`](crate::xpath::collation::DeferredDefault).
+    #[inline]
+    pub(crate) fn deferred_default_collation(
+        &mut self,
+    ) -> crate::xpath::collation::DeferredDefault<'_> {
+        let static_context = self.static_context;
+        crate::xpath::collation::DeferredDefault::with_memo(
+            static_context,
+            &mut self.collation_cache,
+        )
+    }
+
+    /// The general-comparison index cache and the deferred default collation at
+    /// once, for a probe that needs both.
+    #[inline]
+    pub(crate) fn compare_cache_and_default_collation(
+        &mut self,
+    ) -> (
+        &mut crate::xpath::compare_cache::GeneralCompareCache,
+        crate::xpath::collation::DeferredDefault<'_>,
+    ) {
+        let static_context = self.static_context;
+        (
+            &mut self.compare_cache,
+            crate::xpath::collation::DeferredDefault::with_memo(
+                static_context,
+                &mut self.collation_cache,
+            ),
+        )
+    }
+
+    /// The collations resolved during this run. Test-only, like
+    /// [`regex_cache`](Self::regex_cache).
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn collation_cache(&self) -> &crate::xpath::collation::CollationCache {
+        &self.collation_cache
+    }
+
     /// Get a variable value by slot ID.
     pub fn get_variable(&self, slot: VarSlotId) -> Option<&super::functions::XPathValue<N>> {
         self.variables.get(slot)
+    }
+
+    /// How often the variable in `slot` has been written; see
+    /// [`VarStore::generation`].
+    #[inline]
+    pub(crate) fn variable_generation(&self, slot: VarSlotId) -> u64 {
+        self.variables.generation(slot)
+    }
+
+    /// The [serial](VarStore::serial) of the store the variables live in now.
+    #[inline]
+    pub(crate) fn variable_store_serial(&self) -> u64 {
+        self.variables.serial()
     }
 
     /// Set a variable value.
@@ -1268,5 +1591,111 @@ mod extension_slot_tests {
 
         assert_send::<crate::xpath::api::XPathExpr>();
         assert_sync::<crate::xpath::api::XPathExpr>();
+    }
+}
+
+/// XPath 1.0 *compatibility mode*: a static-context flag, not a language mode.
+#[cfg(test)]
+mod xpath10_compatibility_tests {
+    use super::*;
+
+    // ── XPath 1.0 compatibility mode (a static-context flag, not a language mode)
+
+    /// The flag is off by default and `XPathMode::XPath10` implies it.
+    #[test]
+    fn xpath10_compatibility_defaults_to_off_and_the_mode_implies_it() {
+        let names = NameTable::new();
+        assert!(!XPathContext::new(&names).xpath10_compatibility());
+        assert!(XPathContext::new(&names)
+            .with_xpath10_compatibility(true)
+            .xpath10_compatibility());
+        assert!(XPathContext::new(&names)
+            .with_mode(XPathMode::XPath10)
+            .xpath10_compatibility());
+        // The flag does not change the language mode.
+        assert_eq!(
+            XPathContext::new(&names)
+                .with_xpath10_compatibility(true)
+                .mode(),
+            XPathMode::XPath20
+        );
+    }
+
+    /// The flag keeps XPath 2.0 syntax, which `XPathMode::XPath10` rejects.
+    #[test]
+    fn xpath10_compatibility_keeps_xpath20_syntax() {
+        use crate::xpath::api::XPathExpr;
+        use crate::xpath::RoXmlNavigator;
+        let names = NameTable::new();
+
+        let compat = XPathContext::new(&names).with_xpath10_compatibility(true);
+        assert!(XPathExpr::compile("(1, 2, 3)", &compat).is_ok());
+        assert!(XPathExpr::compile("for $i in 1 to 3 return $i", &compat).is_ok());
+
+        // `XPathMode::XPath10` refuses the same expression.
+        let mode10 = XPathContext::new(&names).with_mode(XPathMode::XPath10);
+        let rejected = XPathExpr::compile("(1, 2, 3)", &mode10)
+            .and_then(|e| e.evaluator(&mode10).run::<RoXmlNavigator<'static>>())
+            .err()
+            .expect("XPath 1.0 has no sequence expressions");
+        assert_eq!(rejected.error_code(), Some("XPST0003"));
+    }
+
+    /// The semantics the flag switches: 1.0 arithmetic and the 1.0 first-item
+    /// conversion of `fn:string`/`fn:number` — and the one it does not: the
+    /// effective boolean value.
+    #[test]
+    fn xpath10_compatibility_switches_the_semantics() {
+        use crate::xpath::api::XPathExpr;
+        use crate::xpath::RoXmlNavigator;
+        let names = NameTable::new();
+        let plain = XPathContext::new(&names);
+        let compat = XPathContext::new(&names).with_xpath10_compatibility(true);
+
+        let run = |src: &str, ctx: &XPathContext<'_>| {
+            XPathExpr::compile(src, ctx)
+                .unwrap()
+                .evaluator(ctx)
+                .run::<RoXmlNavigator<'static>>()
+        };
+
+        // Arithmetic: 1.0 divides by zero to infinity, 2.0 raises FOAR0001
+        // for integers.
+        assert!(run("1 div 0", &plain).is_err());
+        assert!(run("1 div 0", &compat)
+            .unwrap()
+            .as_f64()
+            .unwrap()
+            .is_infinite());
+
+        // The effective boolean value is XPath 2.0's (§2.4.3) with the flag
+        // either way: a sequence of two atomic values is FORG0006.
+        assert!(run("if (('a', 'b')) then 1 else 2", &plain).is_err());
+        assert_eq!(
+            run("('a', 'b') and true()", &compat)
+                .err()
+                .and_then(|e| e.error_code()),
+            Some("FORG0006")
+        );
+
+        // fn:string / fn:number take the first item of a sequence.
+        assert!(run("string(('a', 'b'))", &plain).is_err());
+        assert_eq!(
+            run("string(('a', 'b'))", &compat)
+                .unwrap()
+                .as_str()
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            run("number(('7', 'x'))", &compat).unwrap().as_f64(),
+            Some(7.0)
+        );
+        // A non-numeric string is NaN in 1.0 rather than an error.
+        assert!(run("number('x')", &compat)
+            .unwrap()
+            .as_f64()
+            .unwrap()
+            .is_nan());
     }
 }

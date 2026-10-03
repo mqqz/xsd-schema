@@ -203,13 +203,18 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
         FunctionId::False,
         FunctionSignature::new(FN_NAMESPACE, "false", vec![], boolean()),
     ));
+    // F&O §9.3.1 / §15.1.1: `fn:not($arg as item()*)`, `fn:boolean($arg as
+    // item()*)`. The declared `item()*` matters: XPath 1.0 compatibility mode
+    // replaces an argument whose expected type is a single item by its first
+    // item (XPath 2.0 §3.1.5), which would make `boolean((1, 2))` true instead
+    // of FORG0006.
     registry.register(FunctionEntry::new(
         FunctionId::Not,
-        FunctionSignature::new(FN_NAMESPACE, "not", vec![item()], boolean()),
+        FunctionSignature::new(FN_NAMESPACE, "not", vec![any()], boolean()),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Boolean,
-        FunctionSignature::new(FN_NAMESPACE, "boolean", vec![item()], boolean()),
+        FunctionSignature::new(FN_NAMESPACE, "boolean", vec![any()], boolean()),
     ));
 
     // ========================================================================

@@ -3311,6 +3311,118 @@ mod assertion_runtime_tests {
             assertion_errors
         );
     }
+
+    /// Drives `instance` through the fragment-buffer validator and returns
+    /// the root validity and the errors.
+    fn drive_with_assertions(
+        schema_set: &SchemaSet,
+        instance: &str,
+    ) -> (Option<SchemaValidity>, Vec<String>) {
+        use crate::validation::{drive_quick_xml, CollectingValidationSink};
+        let validator =
+            SchemaValidator::new_fragment_buffer(schema_set, ValidationFlags::default());
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let sink = CollectingValidationSink {
+            errors: &mut errors,
+            warnings: &mut warnings,
+        };
+        let mut runtime = validator.start_run(sink);
+        let outcome =
+            drive_quick_xml(instance.as_bytes(), &mut runtime, schema_set).expect("drives");
+        drop(runtime);
+        (
+            outcome.root_validity,
+            errors.iter().map(|e| e.to_string()).collect(),
+        )
+    }
+
+    /// XSD 1.1 §3.13.4.1 clause 1.3: the data model instance an assertion is
+    /// evaluated on "contains only that node and nodes constructed from the
+    /// \[attributes\], \[children\], and descendants of E", and "attempts to
+    /// refer, in an assertion, to the siblings or ancestors of E, or to any
+    /// part of the input document outside of E itself, will be unsuccessful".
+    ///
+    /// The asserted `inner` is nested inside the asserted `outer`, so both are
+    /// evaluated on the one fragment the validator buffers for `outer`; the
+    /// `xml:id` of `inner`'s sibling must stay invisible to `fn:id` in
+    /// `inner`'s assertion, while an id inside `inner` is found.
+    #[test]
+    fn test_assertion_fn_id_sees_only_the_asserted_element() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:import namespace="http://www.w3.org/XML/1998/namespace"/>
+                <xs:complexType name="open">
+                    <xs:anyAttribute processContents="lax"/>
+                </xs:complexType>
+                <xs:element name="outer">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="sib" type="open" minOccurs="0"/>
+                            <xs:element name="inner">
+                                <xs:complexType>
+                                    <xs:sequence>
+                                        <xs:element name="leaf" type="open" minOccurs="0"/>
+                                    </xs:sequence>
+                                    <xs:assert test="empty(id('x'))"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                        <xs:assert test="true()"/>
+                    </xs:complexType>
+                </xs:element>
+                <xs:element name="top">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="leaf" type="open" minOccurs="0"/>
+                        </xs:sequence>
+                        <xs:assert test="exists(id('y'))"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        // The id is on inner's preceding sibling — outside E.
+        let (validity, errors) =
+            drive_with_assertions(&schema_set, r#"<outer><sib xml:id="x"/><inner/></outer>"#);
+        assert!(
+            errors.is_empty(),
+            "id outside E is invisible, got {errors:?}"
+        );
+        assert_eq!(validity, Some(SchemaValidity::Valid));
+
+        // The id is inside E, so `empty(id('x'))` is false.
+        let (_, errors) = drive_with_assertions(
+            &schema_set,
+            r#"<outer><inner><leaf xml:id="x"/></inner></outer>"#,
+        );
+        assert_eq!(errors.len(), 1, "id inside E is found, got {errors:?}");
+        assert!(errors[0].contains("cvc-assertion"), "{errors:?}");
+
+        // Ids on both sides of the boundary: the claimant inside E is found
+        // although an element outside E claims the value first. (The
+        // instance also repeats an ID value, which other constraints may
+        // report; only the assertion outcome is checked here.)
+        let (_, errors) = drive_with_assertions(
+            &schema_set,
+            r#"<outer><sib xml:id="x"/><inner><leaf xml:id="x"/></inner></outer>"#,
+        );
+        let failed: Vec<_> = errors
+            .iter()
+            .filter(|e| e.contains("cvc-assertion"))
+            .collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "the claimant inside E is found, got {errors:?}"
+        );
+
+        // A top-level asserted element finds an id among its descendants.
+        let (validity, errors) =
+            drive_with_assertions(&schema_set, r#"<top><leaf xml:id="y"/></top>"#);
+        assert!(errors.is_empty(), "id inside E is found, got {errors:?}");
+        assert_eq!(validity, Some(SchemaValidity::Valid));
+    }
 }
 
 // ── Fragment arena lifecycle tests ────────────────────────────────

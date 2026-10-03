@@ -12,6 +12,17 @@ pub enum BufferDocumentError {
     #[error("Namespace resolution error: prefix '{0}' not bound")]
     UnboundPrefix(String),
 
+    /// Two elements of one tree answer to the same id value.
+    ///
+    /// Reported when a [`DocumentKind::Full`](super::DocumentKind::Full)
+    /// document read from text, or built by
+    /// [`build_typed_document`](super::build_typed_document), repeats an
+    /// `xml:id` value, and by
+    /// [`BufferDocumentBuilder::register_xml_id`](super::BufferDocumentBuilder::register_xml_id).
+    /// Values are compared as the id index keys them — XML whitespace stripped
+    /// at both ends and collapsed inside, so `xml:id="a"` and `xml:id=" a"`
+    /// collide — and a value that is not a lexical NCName is never an id, so
+    /// it is never a duplicate either. The payload is the normalized value.
     #[error("Duplicate ID value: '{0}'")]
     DuplicateId(String),
 

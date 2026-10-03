@@ -21,15 +21,18 @@ use crate::types::value::{
 };
 use crate::types::XmlTypeCode;
 use crate::xpath::ast::{BinaryOpKind, UnaryOpKind};
+use crate::xpath::atomize::{self, ListMembers};
 use crate::xpath::cast::cast_to;
+use crate::xpath::collation::{self, CollationRef};
 use crate::xpath::context::XPathContext;
 use crate::xpath::error::XPathError;
+use crate::xpath::general_compare;
 use crate::xpath::iterator::{BufferedNodeIterator, XmlItemRef, XmlNodeIterator};
 use crate::xpath::type_info::type_code_to_name;
 use crate::xpath::DomNavigator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NumericClass {
+pub(super) enum NumericClass {
     Byte,
     UnsignedByte,
     Short,
@@ -69,16 +72,49 @@ const XPATH_DECIMAL_DIV_SCALE: u32 = 18;
 /// Evaluate a unary operator for a single atomic value.
 pub fn eval_unary(op: UnaryOpKind, value: &XmlValue) -> Result<XmlValue, XPathError> {
     match op {
-        UnaryOpKind::Identity => Ok(value.clone()),
+        // XPath 2.0 §3.4 and §B.2: unary `+` is `op:numeric-unary-plus($arg as
+        // numeric)`, with the same untypedAtomic-to-xs:double cast and the
+        // same XPTY0004 for a non-numeric operand as unary `-`. F&O §6.2.7:
+        // "The returned value is equal to $arg, and is an instance of
+        // xs:integer, xs:decimal, xs:double, or xs:float depending on the type
+        // of $arg."
+        UnaryOpKind::Identity => eval_numeric_unary_op(value, false),
         UnaryOpKind::Negate => eval_numeric_unary(value),
     }
 }
 
 /// Evaluate a binary operator for two atomic values.
+///
+/// String operands are compared under the Unicode codepoint collation. To
+/// compare them under the static context's default collation instead — which is
+/// what the `eq`, `ne`, `lt`, `le`, `gt` and `ge` operators of an expression do
+/// — the engine uses the crate-private `eval_binary_collated`.
 pub fn eval_binary(
     op: BinaryOpKind,
     left: &XmlValue,
     right: &XmlValue,
+) -> Result<XmlValue, XPathError> {
+    eval_binary_collated(op, left, right, CollationRef::Codepoint)
+}
+
+/// [`eval_binary`] with an explicit collation for string operands.
+///
+/// `collation` is [`CollationRef::Codepoint`] for the Unicode codepoint
+/// collation, which takes the very same code path [`eval_binary`] always took.
+///
+/// XPath 2.0 §2.1.1 defines the static context's default collation as "the
+/// collation to be used by functions and operators for comparing and ordering
+/// values of type `xs:string` and `xs:anyURI` (and types derived from them)",
+/// and §B.2 Operator Mapping spells the `eq` of two `xs:string` values as
+/// `op:numeric-equal(fn:compare(A, B), 0)` — `fn:compare` under the default
+/// collation. `xs:anyURI` has the same row, and §B.1 adds the note that
+/// "functions and operators that compare strings using the default collation
+/// also compare `xs:anyURI` values using the default collation".
+pub(crate) fn eval_binary_collated(
+    op: BinaryOpKind,
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
 ) -> Result<XmlValue, XPathError> {
     match op {
         BinaryOpKind::Add | BinaryOpKind::Sub | BinaryOpKind::Mul | BinaryOpKind::Div => {
@@ -89,22 +125,22 @@ pub fn eval_binary(
         }
         BinaryOpKind::IDiv | BinaryOpKind::Mod => eval_numeric_binary(op, left, right),
         BinaryOpKind::GeneralEq | BinaryOpKind::ValueEq => {
-            Ok(XmlValue::boolean(compare_eq(left, right)?))
+            Ok(XmlValue::boolean(compare_eq(left, right, collation)?))
         }
         BinaryOpKind::GeneralNe | BinaryOpKind::ValueNe => {
-            Ok(XmlValue::boolean(!compare_eq(left, right)?))
+            Ok(XmlValue::boolean(!compare_eq(left, right, collation)?))
         }
         BinaryOpKind::GeneralGt | BinaryOpKind::ValueGt => {
-            Ok(XmlValue::boolean(compare_gt(left, right)?))
+            Ok(XmlValue::boolean(compare_gt(left, right, collation)?))
         }
         BinaryOpKind::GeneralGe | BinaryOpKind::ValueGe => {
-            Ok(XmlValue::boolean(compare_ge(left, right)?))
+            Ok(XmlValue::boolean(compare_ge(left, right, collation)?))
         }
         BinaryOpKind::GeneralLt | BinaryOpKind::ValueLt => {
-            Ok(XmlValue::boolean(compare_lt(left, right)?))
+            Ok(XmlValue::boolean(compare_lt(left, right, collation)?))
         }
         BinaryOpKind::GeneralLe | BinaryOpKind::ValueLe => {
-            Ok(XmlValue::boolean(compare_le(left, right)?))
+            Ok(XmlValue::boolean(compare_le(left, right, collation)?))
         }
         BinaryOpKind::And | BinaryOpKind::Or => eval_boolean_logic(op, left, right),
         BinaryOpKind::Is | BinaryOpKind::Before | BinaryOpKind::After => {
@@ -188,7 +224,11 @@ fn eval_boolean_logic(
     Ok(XmlValue::boolean(result))
 }
 
-fn compare_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+fn compare_eq(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
     let left = unwrap_union_value(left);
     let right = unwrap_union_value(right);
 
@@ -212,7 +252,8 @@ fn compare_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     }
 
     if is_string_like(left.type_code) && is_string_like(right.type_code) {
-        return Ok(left.to_string_value() == right.to_string_value());
+        let (left_value, right_value) = (left.to_string_value(), right.to_string_value());
+        return collation.equals(&left_value, &right_value);
     }
 
     if left.type_code == right.type_code {
@@ -228,7 +269,11 @@ fn compare_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     Err(operator_not_defined("op:eq", left, right))
 }
 
-fn compare_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+fn compare_gt(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
     let left = unwrap_union_value(left);
     let right = unwrap_union_value(right);
 
@@ -249,30 +294,44 @@ fn compare_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     if is_string_like(left.type_code) && is_string_like(right.type_code) {
         let left_value = left.to_string_value();
         let right_value = right.to_string_value();
-        return Ok(compare_string_values(&left_value, &right_value) == Ordering::Greater);
+        return Ok(
+            compare_string_values(&left_value, &right_value, collation)? == Ordering::Greater
+        );
     }
 
     Err(operator_not_defined("op:gt", left, right))
 }
 
-fn compare_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    match compare_eq(left, right) {
+fn compare_ge(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    match compare_eq(left, right, collation) {
         Ok(true) => Ok(true),
-        Ok(false) => compare_gt(left, right),
-        Err(err) if is_operator_not_defined(&err) => compare_gt(left, right),
+        Ok(false) => compare_gt(left, right, collation),
+        Err(err) if is_operator_not_defined(&err) => compare_gt(left, right, collation),
         Err(err) => Err(err),
     }
 }
 
-fn compare_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_gt(right, left)
+fn compare_lt(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    compare_gt(right, left, collation)
 }
 
-fn compare_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    match compare_eq(left, right) {
+fn compare_le(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    match compare_eq(left, right, collation) {
         Ok(true) => Ok(true),
-        Ok(false) => compare_lt(left, right),
-        Err(err) if is_operator_not_defined(&err) => compare_lt(left, right),
+        Ok(false) => compare_lt(left, right, collation),
+        Err(err) if is_operator_not_defined(&err) => compare_lt(left, right, collation),
         Err(err) => Err(err),
     }
 }
@@ -458,8 +517,20 @@ fn list_values_equal(left: &XmlValue, right: &XmlValue) -> bool {
     }
 }
 
-fn compare_string_values(left: &str, right: &str) -> Ordering {
-    left.cmp(right)
+/// The order two string values are in, under `collation`.
+///
+/// [`CollationRef::Codepoint`] is `str::cmp` — the only thing this function ever
+/// did, and still the only thing it does unless a host has installed a
+/// [`CollationResolver`](crate::xpath::collation::CollationResolver) *and* named
+/// a different default collation. A URI the host does not support raises
+/// FOCH0002 here, which is exactly where F&O §7.3.1 wants it: at the string
+/// comparison that needed the collation.
+fn compare_string_values(
+    left: &str,
+    right: &str,
+    collation: CollationRef<'_>,
+) -> Result<Ordering, XPathError> {
+    collation.compare(left, right)
 }
 
 fn eval_temporal_add(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPathError> {
@@ -719,6 +790,11 @@ fn numeric_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
 }
 
 fn eval_numeric_unary(value: &XmlValue) -> Result<XmlValue, XPathError> {
+    eval_numeric_unary_op(value, true)
+}
+
+/// Unary `-` (`negate`) or unary `+` on one atomic operand.
+fn eval_numeric_unary_op(value: &XmlValue, negate: bool) -> Result<XmlValue, XPathError> {
     // Per XPath 2.0 spec, UntypedAtomic is cast to xs:double for arithmetic
     let promoted;
     let value = if value.type_code == XmlTypeCode::UntypedAtomic {
@@ -727,17 +803,27 @@ fn eval_numeric_unary(value: &XmlValue) -> Result<XmlValue, XPathError> {
     } else {
         value
     };
-    let class = numeric_class(value.type_code)
-        .ok_or_else(|| XPathError::internal("Unary operator requires numeric operand"))?;
+    // XPath 2.0 §3.4: the unary operators are defined for numeric operands only;
+    // anything else is a type error [err:XPTY0004].
+    let class = numeric_class(value.type_code).ok_or_else(|| {
+        XPathError::unary_operator_not_defined(
+            "unary arithmetic operator",
+            type_code_to_name(value.type_code),
+        )
+    })?;
 
     let result_type = unary_result_type(class);
     let value = to_numeric_value(value, class)?;
 
-    let result = match value {
-        NumericValue::Integer(v) => NumericValue::Integer(-v),
-        NumericValue::Decimal(v) => NumericValue::Decimal(-v),
-        NumericValue::Float(v) => NumericValue::Float(-v),
-        NumericValue::Double(v) => NumericValue::Double(-v),
+    let result = if !negate {
+        value
+    } else {
+        match value {
+            NumericValue::Integer(v) => NumericValue::Integer(-v),
+            NumericValue::Decimal(v) => NumericValue::Decimal(-v),
+            NumericValue::Float(v) => NumericValue::Float(-v),
+            NumericValue::Double(v) => NumericValue::Double(-v),
+        }
     };
 
     Ok(numeric_to_xml_value(result, result_type))
@@ -857,23 +943,44 @@ fn numeric_idiv(left: NumericValue, right: NumericValue) -> Result<XmlValue, XPa
             NumericValue::Integer(decimal_to_bigint(&q)?)
         }
         (NumericValue::Float(l), NumericValue::Float(r)) => {
-            let q = l / r;
-            if q.is_nan() || q.is_infinite() {
-                return Err(XPathError::FOAR0001);
-            }
-            NumericValue::Integer(BigInt::from(q.trunc() as i64))
+            NumericValue::Integer(float_idiv(f64::from(l), f64::from(r), |q| {
+                f64::from(q as f32)
+            })?)
         }
         (NumericValue::Double(l), NumericValue::Double(r)) => {
-            let q = l / r;
-            if q.is_nan() || q.is_infinite() {
-                return Err(XPathError::FOAR0001);
-            }
-            NumericValue::Integer(BigInt::from(q.trunc() as i64))
+            NumericValue::Integer(float_idiv(l, r, |q| q)?)
         }
         _ => return Err(XPathError::internal("Numeric idiv type mismatch")),
     };
 
     Ok(numeric_to_xml_value(result, XmlTypeCode::Integer))
+}
+
+/// `idiv` of two `xs:float` or `xs:double` values (both given as `f64`;
+/// `round` brings the quotient back to the operands' precision).
+///
+/// F&O §6.2.5: "If $arg2 is (positive or negative) zero, then an error is
+/// raised \[err:FOAR0001\]. If either operand is NaN or if $arg1 is INF or
+/// -INF then an error is raised \[err:FOAR0002\]. If $arg2 is INF or -INF (and
+/// $arg1 is not) then the result is zero." A quotient too large for the
+/// floating-point type is the overflow FOAR0002 names too; any finite quotient
+/// becomes the exact xs:integer of its truncation, however large.
+fn float_idiv(l: f64, r: f64, round: impl Fn(f64) -> f64) -> Result<BigInt, XPathError> {
+    if r == 0.0 {
+        return Err(XPathError::FOAR0001);
+    }
+    if l.is_nan() || r.is_nan() || l.is_infinite() {
+        return Err(XPathError::FOAR0002);
+    }
+    let quotient = round(l / r);
+    if quotient.is_infinite() {
+        return Err(XPathError::FOAR0002);
+    }
+    let truncated = quotient.trunc();
+    // `{:.0}` prints every digit of a finite integral `f64`.
+    format!("{truncated:.0}")
+        .parse::<BigInt>()
+        .map_err(|_| XPathError::FOAR0002)
 }
 
 fn numeric_mod(
@@ -907,10 +1014,8 @@ fn numeric_mod(
 /// expressions are cast to `xs:double`.
 fn cast_untyped_to_double(value: &XmlValue) -> Result<XmlValue, XPathError> {
     let s = value.to_string_value();
-    let d: f64 = s
-        .trim()
-        .parse()
-        .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
+    let d = crate::xpath::cast::parse_xsd_double(&s)
+        .ok_or_else(|| XPathError::invalid_cast_value(&s, "xs:double"))?;
     Ok(XmlValue::double(d))
 }
 
@@ -934,10 +1039,17 @@ fn promote_numeric(
         right
     };
 
-    let left_class = numeric_class(left_ref.type_code)
-        .ok_or_else(|| XPathError::internal("Left operand not numeric"))?;
-    let right_class = numeric_class(right_ref.type_code)
-        .ok_or_else(|| XPathError::internal("Right operand not numeric"))?;
+    // XPath 2.0 §3.4: an operand combination that is not valid for the operator
+    // is a type error [err:XPTY0004], not an internal failure.
+    let not_numeric = || {
+        XPathError::binary_operator_not_defined(
+            "arithmetic operator",
+            type_code_to_name(left_ref.type_code),
+            type_code_to_name(right_ref.type_code),
+        )
+    };
+    let left_class = numeric_class(left_ref.type_code).ok_or_else(not_numeric)?;
+    let right_class = numeric_class(right_ref.type_code).ok_or_else(not_numeric)?;
 
     let promotion = numeric_promotion(left_class, right_class);
     let target_class = match promotion {
@@ -952,7 +1064,7 @@ fn promote_numeric(
     Ok((left_val, right_val, target_class))
 }
 
-fn numeric_class(code: XmlTypeCode) -> Option<NumericClass> {
+pub(super) fn numeric_class(code: XmlTypeCode) -> Option<NumericClass> {
     match code {
         XmlTypeCode::Byte => Some(NumericClass::Byte),
         XmlTypeCode::UnsignedByte => Some(NumericClass::UnsignedByte),
@@ -1200,7 +1312,7 @@ fn xml_day_time_duration_value(value: DayTimeDurationValue) -> XmlValue {
     }
 }
 
-fn is_temporal_type(code: XmlTypeCode) -> bool {
+pub(super) fn is_temporal_type(code: XmlTypeCode) -> bool {
     matches!(
         code,
         XmlTypeCode::DateTime
@@ -1213,11 +1325,11 @@ fn is_temporal_type(code: XmlTypeCode) -> bool {
     )
 }
 
-fn is_date_time_code(code: XmlTypeCode) -> bool {
+pub(super) fn is_date_time_code(code: XmlTypeCode) -> bool {
     matches!(code, XmlTypeCode::DateTime | XmlTypeCode::DateTimeStamp)
 }
 
-fn is_duration_code(code: XmlTypeCode) -> bool {
+pub(super) fn is_duration_code(code: XmlTypeCode) -> bool {
     matches!(
         code,
         XmlTypeCode::Duration | XmlTypeCode::YearMonthDuration | XmlTypeCode::DayTimeDuration
@@ -1280,6 +1392,36 @@ fn duration_parts(value: &XmlValue) -> Result<Option<(i64, Decimal)>, XPathError
         return Ok(Some((0, seconds)));
     }
     Ok(None)
+}
+
+// ----------------------------------------------------------------------------
+// Comparison keys for the indexed general comparison
+// ----------------------------------------------------------------------------
+//
+// Each of these exposes the *exact* normalization `compare_eq` performs on a
+// value of that family, so that `general_compare` can key a hash table on it
+// without inventing a second notion of equality. `None` means the value does
+// not hold the expected representation, which is the case in which the
+// comparison itself would raise.
+
+/// The instant `eq` compares an `xs:dateTime`/`xs:dateTimeStamp` value at.
+pub(super) fn datetime_compare_key(value: &XmlValue) -> Option<Result<Decimal, XPathError>> {
+    as_datetime(value).map(datetime_instant_for_compare)
+}
+
+/// The instant `eq` compares an `xs:date` value at.
+pub(super) fn date_compare_key(value: &XmlValue) -> Option<Result<Decimal, XPathError>> {
+    as_date(value).map(date_instant_for_compare)
+}
+
+/// The seconds-of-day `eq` compares an `xs:time` value at.
+pub(super) fn time_compare_key(value: &XmlValue) -> Option<Result<Decimal, XPathError>> {
+    as_time(value).map(time_seconds_for_compare)
+}
+
+/// The (months, seconds) pair `eq` compares any duration value by.
+pub(super) fn duration_compare_key(value: &XmlValue) -> Result<Option<(i64, Decimal)>, XPathError> {
+    duration_parts(value)
 }
 
 fn numeric_to_f64(value: &XmlValue) -> Result<f64, XPathError> {
@@ -1888,7 +2030,7 @@ fn decimal_to_u8(value: Decimal, label: &str) -> Result<u8, XPathError> {
     u8::try_from(val).map_err(|_| XPathError::internal(format!("{} out of range", label)))
 }
 
-fn is_string_like(code: XmlTypeCode) -> bool {
+pub(super) fn is_string_like(code: XmlTypeCode) -> bool {
     code.is_string_derived() || matches!(code, XmlTypeCode::AnyUri | XmlTypeCode::UntypedAtomic)
 }
 
@@ -1925,10 +2067,8 @@ pub fn magnitude_relationship(
         if right.type_code.is_numeric() {
             // Promote to double
             let s = left.to_string_value();
-            let d: f64 = s
-                .trim()
-                .parse()
-                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
+            let d = crate::xpath::cast::parse_xsd_double(&s)
+                .ok_or_else(|| XPathError::invalid_cast_value(&s, "xs:double"))?;
             left_result = XmlValue::double(d);
         } else if is_string_like(right.type_code) {
             // Keep as string
@@ -1942,10 +2082,8 @@ pub fn magnitude_relationship(
         if left_result.type_code.is_numeric() {
             // Promote to double
             let s = right.to_string_value();
-            let d: f64 = s
-                .trim()
-                .parse()
-                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
+            let d = crate::xpath::cast::parse_xsd_double(&s)
+                .ok_or_else(|| XPathError::invalid_cast_value(&s, "xs:double"))?;
             right_result = XmlValue::double(d);
         } else if is_string_like(left_result.type_code) {
             // Keep as string
@@ -2180,10 +2318,8 @@ pub fn magnitude_relationship_ctx(
         if right.type_code.is_numeric() {
             // Numeric → cast to xs:double
             let s = left_result.to_string_value();
-            let d: f64 = s
-                .trim()
-                .parse()
-                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
+            let d = crate::xpath::cast::parse_xsd_double(&s)
+                .ok_or_else(|| XPathError::invalid_cast_value(&s, "xs:double"))?;
             left_result = XmlValue::double(d);
         } else if is_string_like(right.type_code) {
             // String-like → cast to xs:string
@@ -2200,10 +2336,8 @@ pub fn magnitude_relationship_ctx(
         if left_result.type_code.is_numeric() {
             // Numeric → cast to xs:double
             let s = right_result.to_string_value();
-            let d: f64 = s
-                .trim()
-                .parse()
-                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
+            let d = crate::xpath::cast::parse_xsd_double(&s)
+                .ok_or_else(|| XPathError::invalid_cast_value(&s, "xs:double"))?;
             right_result = XmlValue::double(d);
         } else if is_string_like(left_result.type_code) {
             // String-like → cast to xs:string
@@ -2222,10 +2356,76 @@ pub fn magnitude_relationship_ctx(
     Ok((left_result, right_result))
 }
 
-fn atomize_item<N: DomNavigator>(item: XmlItemRef<'_, N>) -> Result<Option<XmlValue>, XPathError> {
+/// The value one item of a general-comparison operand atomizes to, as it is
+/// stored: an atomic value as it is, a node's typed value (`None` for a nilled
+/// element). A list-typed node's typed value comes back packed; the callers
+/// take it apart with [`atomize::unpack_list`] — [`AtomCursor`] for the
+/// pairwise loops, `general_compare`'s atomizers for the hash index.
+pub(super) fn atomize_item<N: DomNavigator>(
+    item: XmlItemRef<'_, N>,
+) -> Result<Option<XmlValue>, XPathError> {
     match item {
         XmlItemRef::Atomic(value) => Ok(Some(value.clone())),
-        XmlItemRef::Node(node) => crate::xpath::atomize::atomize_node(node),
+        XmlItemRef::Node(node) => atomize::atomize_node(node),
+    }
+}
+
+/// A cursor over the atomized values of a general-comparison operand, in
+/// order (XPath 2.0 §3.5.2: "Atomization is applied to each operand").
+///
+/// A nilled element contributes no value and a list-typed node one value per
+/// member, so the pairwise loops below walk the Cartesian product of the two
+/// atomized operands in row-major order. Each item is atomized when the cursor
+/// reaches it, never before, so an item that cannot be atomized raises its
+/// error exactly where the loop meets it. A value that is not a list costs two
+/// discriminant tests more than the item itself: no list in progress, and not
+/// a packed list ([`atomize::is_packed_list`]).
+struct AtomCursor<I: XmlNodeIterator> {
+    items: I,
+    /// The members of the list being walked, if the current item was one.
+    pending: Option<ListMembers>,
+}
+
+impl<I: XmlNodeIterator> AtomCursor<I> {
+    fn new(items: I) -> Self {
+        Self {
+            items,
+            pending: None,
+        }
+    }
+
+    /// The next atomized value, or `None` at the end of the operand.
+    #[inline]
+    fn next_atom(&mut self) -> Result<Option<XmlValue>, XPathError> {
+        if let Some(members) = &mut self.pending {
+            if let Some(member) = members.next() {
+                return Ok(Some(member));
+            }
+            self.pending = None;
+        }
+        while self.items.move_next()? {
+            let item = self
+                .items
+                .current()
+                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+            let Some(value) = atomize_item(item)? else {
+                continue; // nilled → no value
+            };
+            if !atomize::is_packed_list(&value) {
+                return Ok(Some(value));
+            }
+            match atomize::unpack_list(value) {
+                Ok(mut members) => {
+                    if let Some(first) = members.next() {
+                        self.pending = Some(members);
+                        return Ok(Some(first));
+                    }
+                    // An empty list contributes no value.
+                }
+                Err(value) => return Ok(Some(value)),
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -2233,28 +2433,58 @@ fn atomize_item<N: DomNavigator>(item: XmlItemRef<'_, N>) -> Result<Option<XmlVa
 ///
 /// This is the core equality comparison used by both value and general comparisons.
 /// For general comparisons, use `magnitude_relationship` first to promote UntypedAtomic values.
+///
+/// Strings are compared under the Unicode codepoint collation; the collated
+/// twins below take the collation the expression is actually evaluated with.
 pub fn value_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_eq(left, right)
+    compare_eq(left, right, CollationRef::Codepoint)
 }
 
 /// Compare two values for greater-than (value comparison).
 pub fn value_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_gt(left, right)
+    compare_gt(left, right, CollationRef::Codepoint)
 }
 
 /// Compare two values for greater-than-or-equal (value comparison).
 pub fn value_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_ge(left, right)
+    compare_ge(left, right, CollationRef::Codepoint)
 }
 
 /// Compare two values for less-than (value comparison).
 pub fn value_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_lt(left, right)
+    compare_lt(left, right, CollationRef::Codepoint)
 }
 
 /// Compare two values for less-than-or-equal (value comparison).
 pub fn value_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_le(left, right)
+    compare_le(left, right, CollationRef::Codepoint)
+}
+
+/// [`value_eq`] under `collation` (`None` = codepoint).
+pub(crate) fn value_eq_collated(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    compare_eq(left, right, collation)
+}
+
+/// [`value_gt`] under `collation` (`None` = codepoint).
+pub(crate) fn value_gt_collated(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    compare_gt(left, right, collation)
+}
+
+/// [`value_lt`] under `collation` (`None` = codepoint).
+pub(crate) fn value_lt_collated(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    compare_lt(left, right, collation)
 }
 
 // ============================================================================
@@ -2267,13 +2497,13 @@ pub fn value_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
 /// For sequence comparisons, use `general_eq_seq`.
 pub fn general_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_eq(&l, &r)
+    compare_eq(&l, &r, CollationRef::Codepoint)
 }
 
 /// General greater-than comparison with magnitude relationship promotion (single values).
 pub fn general_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_gt(&l, &r)
+    compare_gt(&l, &r, CollationRef::Codepoint)
 }
 
 /// General not-equal comparison with magnitude relationship promotion (single values).
@@ -2284,19 +2514,19 @@ pub fn general_ne(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError>
 /// General greater-than-or-equal comparison with magnitude relationship promotion (single values).
 pub fn general_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_ge(&l, &r)
+    compare_ge(&l, &r, CollationRef::Codepoint)
 }
 
 /// General less-than comparison with magnitude relationship promotion (single values).
 pub fn general_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_lt(&l, &r)
+    compare_lt(&l, &r, CollationRef::Codepoint)
 }
 
 /// General less-than-or-equal comparison with magnitude relationship promotion (single values).
 pub fn general_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_le(&l, &r)
+    compare_le(&l, &r, CollationRef::Codepoint)
 }
 
 // ============================================================================
@@ -2312,39 +2542,128 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
+    // The static context's default collation, resolved only if two strings are
+    // actually compared, and then once for the whole comparison rather than
+    // once per pair. Under the codepoint collation — the default, and the only
+    // collation without a host resolver — this is an `Option::is_none()` and
+    // the handle is `Codepoint`, which is the code path every line below took
+    // before collations existed.
+    let deferred = collation::DeferredDefault::new(context);
+    general_eq_iter_collated(context, left, right, deferred.as_ref())
+}
+
+/// [`general_eq_iter`] under the collation `collation` — the evaluator's entry
+/// point, which hands in a default collation resolved through the per-run memo.
+pub(crate) fn general_eq_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let mut left_iter = left.clone();
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    // Walk a bounded prefix of the Cartesian product first. Every comparison
+    // whose product is no larger than the budget, and every comparison whose
+    // first true pair falls inside it, is decided at exactly the cost it had
+    // before — which is what the small comparisons in predicates need.
+    if let Some(result) = general_eq_scan(context, left, &right_buf, INDEX_AFTER_PAIRS, collation)?
+    {
+        return Ok(result);
+    }
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+    // Only a genuinely large product gets here. A hash index answers the same
+    // question in O(|A| + |B|) for the operand shapes where that is provably
+    // the same answer, errors included; it declines everything else.
+    if let Some(result) = general_compare::try_indexed_eq(context, left, &right_buf, collation) {
+        return result;
+    }
+
+    Ok(general_eq_scan(context, left, &right_buf, usize::MAX, collation)?.unwrap_or(false))
+}
+
+/// How many pairs of the Cartesian product are compared before an index is
+/// considered.
+///
+/// The budget exists so that the indexed path can never cost more than the
+/// pairwise one on a comparison the pairwise one would have finished quickly:
+/// `(a, b, c) = (x, y)` is answered without ever atomizing an operand twice,
+/// and so is a large comparison whose very first pairs already match.
+const INDEX_AFTER_PAIRS: usize = 64;
+
+/// The Cartesian-product evaluation of `A = B`, and the definition of what the
+/// indexed path in [`general_compare`] must reproduce exactly. (The production
+/// paths run the same [`general_eq_scan`] with an unbounded budget; this is the
+/// tests' reference.)
+#[cfg(test)]
+pub(super) fn general_eq_iter_pairwise<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right_buf: &BufferedNodeIterator<I2>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let deferred = collation::DeferredDefault::new(context);
+    Ok(general_eq_scan(context, left, right_buf, usize::MAX, deferred.as_ref())?.unwrap_or(false))
+}
+
+/// Walk at most `budget` pairs of the product in row-major order.
+///
+/// `Ok(None)` means the budget ran out before the product did, and nothing has
+/// been decided: no pair compared true and none raised a hard error, so the
+/// caller is free to answer the comparison any way it likes. With a budget of
+/// `usize::MAX` the result is never `None` and this is the original loop.
+fn general_eq_scan<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right_buf: &BufferedNodeIterator<I2>,
+    budget: usize,
+    collation: CollationRef<'_>,
+) -> Result<Option<bool>, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let mut left_atoms = AtomCursor::new(left.clone());
+    let mut remaining = budget;
+    // XPath 2.0 §3.5.2 lets a general comparison return true as soon as it finds
+    // a pair with the required magnitude relationship, so an incomparable pair
+    // found on the way there may be ignored. If no pair compares true, the
+    // comparison of the incomparable pair is what decides the result, and that
+    // comparison is a type error (§3.5.1).
+    let mut deferred: Option<XPathError> = None;
+
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
+
+        while let Some(right_value) = right_atoms.next_atom()? {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            remaining -= 1;
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq(&l, &r) {
-                Ok(true) => return Ok(true),
+            match value_eq_collated(&l, &r, collation) {
+                Ok(true) => return Ok(Some(true)),
                 Ok(false) => continue,
-                Err(err) if is_operator_not_defined(&err) => continue,
+                Err(err) if is_operator_not_defined(&err) => {
+                    deferred.get_or_insert(err);
+                    continue;
+                }
                 Err(err) => return Err(err),
             }
         }
     }
 
-    Ok(false)
+    match deferred {
+        Some(err) => Err(err),
+        None => Ok(Some(false)),
+    }
 }
 
 pub fn general_ne_iter<I1, I2>(
@@ -2356,39 +2675,100 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
+    let deferred = collation::DeferredDefault::new(context);
+    general_ne_iter_collated(context, left, right, deferred.as_ref())
+}
+
+/// [`general_ne_iter`] under the collation `collation`.
+pub(crate) fn general_ne_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let mut left_iter = left.clone();
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    // `!=` already stops at the first unequal pair, so the bounded prefix
+    // decides it in practice; the index is only there for the degenerate
+    // all-equal product, and it declines everything else.
+    if let Some(result) = general_ne_scan(context, left, &right_buf, INDEX_AFTER_PAIRS, collation)?
+    {
+        return Ok(result);
+    }
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+    if let Some(result) = general_compare::try_indexed_ne(left, &right_buf, collation) {
+        return result;
+    }
+
+    Ok(general_ne_scan(context, left, &right_buf, usize::MAX, collation)?.unwrap_or(false))
+}
+
+/// The Cartesian-product evaluation of `A != B` (the tests' reference, like
+/// [`general_eq_iter_pairwise`]).
+#[cfg(test)]
+pub(super) fn general_ne_iter_pairwise<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right_buf: &BufferedNodeIterator<I2>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let deferred = collation::DeferredDefault::new(context);
+    Ok(general_ne_scan(context, left, right_buf, usize::MAX, deferred.as_ref())?.unwrap_or(false))
+}
+
+/// The `!=` counterpart of [`general_eq_scan`]; see it for what `Ok(None)` means.
+fn general_ne_scan<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right_buf: &BufferedNodeIterator<I2>,
+    budget: usize,
+    collation: CollationRef<'_>,
+) -> Result<Option<bool>, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let mut left_atoms = AtomCursor::new(left.clone());
+    let mut remaining = budget;
+    // An incomparable pair is *not* an unequal pair: §3.5.2 defers to the `ne`
+    // value comparison, and §3.5.1 makes an incomparable `ne` a type error. The
+    // error is held back in case a genuinely unequal pair turns up, which §3.5.2
+    // allows to decide the comparison on its own.
+    let mut deferred: Option<XPathError> = None;
+
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
+
+        while let Some(right_value) = right_atoms.next_atom()? {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            remaining -= 1;
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq(&l, &r) {
+            match value_eq_collated(&l, &r, collation) {
                 Ok(true) => continue,
-                Ok(false) => return Ok(true),
-                Err(err) if is_operator_not_defined(&err) => return Ok(true),
+                Ok(false) => return Ok(Some(true)),
+                Err(err) if is_operator_not_defined(&err) => {
+                    deferred.get_or_insert(err);
+                    continue;
+                }
                 Err(err) => return Err(err),
             }
         }
     }
 
-    Ok(false)
+    match deferred {
+        Some(err) => Err(err),
+        None => Ok(Some(false)),
+    }
 }
 
 pub fn general_lt_iter<I1, I2>(
@@ -2400,30 +2780,31 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
+    let deferred = collation::DeferredDefault::new(context);
+    general_lt_iter_collated(context, left, right, deferred.as_ref())
+}
+
+/// [`general_lt_iter`] under the collation `collation`.
+pub(crate) fn general_lt_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_lt(&l, &r) {
+            match value_lt_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -2443,37 +2824,38 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
+    let deferred = collation::DeferredDefault::new(context);
+    general_le_iter_collated(context, left, right, deferred.as_ref())
+}
+
+/// [`general_le_iter`] under the collation `collation`.
+pub(crate) fn general_le_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq(&l, &r) {
+            match value_eq_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => {}
                 Err(err) if is_operator_not_defined(&err) => {}
                 Err(err) => return Err(err),
             }
 
-            match value_lt(&l, &r) {
+            match value_lt_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -2493,30 +2875,31 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
+    let deferred = collation::DeferredDefault::new(context);
+    general_gt_iter_collated(context, left, right, deferred.as_ref())
+}
+
+/// [`general_gt_iter`] under the collation `collation`.
+pub(crate) fn general_gt_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_gt(&l, &r) {
+            match value_gt_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -2536,37 +2919,38 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
+    let deferred = collation::DeferredDefault::new(context);
+    general_ge_iter_collated(context, left, right, deferred.as_ref())
+}
+
+/// [`general_ge_iter`] under the collation `collation`.
+pub(crate) fn general_ge_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq(&l, &r) {
+            match value_eq_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => {}
                 Err(err) if is_operator_not_defined(&err) => {}
                 Err(err) => return Err(err),
             }
 
-            match value_gt(&l, &r) {
+            match value_gt_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -2649,7 +3033,12 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralEq, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralEq,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
 /// XPath 1.0 general not-equal comparison (iterator-based, Cartesian product).
@@ -2658,7 +3047,12 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralNe, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralNe,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
 /// XPath 1.0 general less-than comparison (iterator-based, Cartesian product).
@@ -2667,7 +3061,12 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralLt, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralLt,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
 /// XPath 1.0 general less-than-or-equal comparison (iterator-based, Cartesian product).
@@ -2676,7 +3075,12 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralLe, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralLe,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
 /// XPath 1.0 general greater-than comparison (iterator-based, Cartesian product).
@@ -2685,7 +3089,12 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralGt, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralGt,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
 /// XPath 1.0 general greater-than-or-equal comparison (iterator-based, Cartesian product).
@@ -2694,50 +3103,68 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralGe, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralGe,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
-/// Shared implementation for all XPath 1.0 general comparison iterators.
-fn general_compare_iter_10<I1, I2>(
+/// The XPath 1.0 compatibility-mode general comparison under `collation`.
+///
+/// XPath 2.0 §3.5.2 evaluates a general comparison in compatibility mode by
+/// converting the operands and then: "After performing the conversions
+/// described above, the atomic values are compared using one of the value
+/// comparison operators eq, ne, lt, le, gt, or ge, depending on whether the
+/// general comparison operator was =, !=, <, <=, >, or >=." A value comparison
+/// of two strings uses the default collation (§3.5.1; §B.2 maps it to
+/// `fn:compare`), so the engine passes the static context's default collation
+/// here — the same collation `eq` uses — and the public `general_*_iter_10`
+/// functions, which have no static context, pass the codepoint collation.
+///
+/// Only `=` and `!=` can reach a string comparison: for `<`, `<=`, `>` and `>=`
+/// every operand is converted with `fn:number` first (§3.5.2 rule 3). An
+/// unsupported collation is therefore FOCH0002 exactly where two strings are
+/// compared, and nowhere else.
+pub(crate) fn general_compare_iter_10<I1, I2>(
     op: BinaryOpKind,
     left: &I1,
     right: &I2,
+    collation: CollationRef<'_>,
 ) -> Result<bool, XPathError>
 where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = coerce_for_comparison_10(op, &left_value, &right_value);
 
-            let satisfied = match op {
-                BinaryOpKind::GeneralEq => compare_eq(&l, &r).unwrap_or(false),
-                BinaryOpKind::GeneralNe => !compare_eq(&l, &r).unwrap_or(true),
-                BinaryOpKind::GeneralLt => compare_lt(&l, &r).unwrap_or(false),
-                BinaryOpKind::GeneralLe => compare_le(&l, &r).unwrap_or(false),
-                BinaryOpKind::GeneralGt => compare_gt(&l, &r).unwrap_or(false),
-                BinaryOpKind::GeneralGe => compare_ge(&l, &r).unwrap_or(false),
+            let compared = match op {
+                BinaryOpKind::GeneralEq => compare_eq(&l, &r, collation),
+                BinaryOpKind::GeneralNe => compare_eq(&l, &r, collation).map(|eq| !eq),
+                BinaryOpKind::GeneralLt => compare_lt(&l, &r, collation),
+                BinaryOpKind::GeneralLe => compare_le(&l, &r, collation),
+                BinaryOpKind::GeneralGt => compare_gt(&l, &r, collation),
+                BinaryOpKind::GeneralGe => compare_ge(&l, &r, collation),
                 _ => unreachable!(),
+            };
+            let satisfied = match compared {
+                Ok(satisfied) => satisfied,
+                // A collation nobody supplies is FOCH0002 when two strings
+                // are compared (F&O §7.3.1); it must not read as "no match".
+                Err(err @ XPathError::FOCH0002 { .. }) => return Err(err),
+                // After `coerce_for_comparison_10` both operands are booleans,
+                // doubles or strings, so no other comparison error can arise;
+                // this is the pair-does-not-match reading the compatibility
+                // path has had since it was written.
+                Err(_) => false,
             };
 
             if satisfied {
@@ -2940,11 +3367,21 @@ pub fn general_ge_seq(left: &[XmlValue], right: &[XmlValue]) -> Result<bool, XPa
     Ok(false)
 }
 
+/// The XPath 2.0 §3.4 type error for an operand combination that
+/// B.2 Operator Mapping does not cover.
+///
+/// It uses the dedicated `BinaryOperatorNotDefined` variant, whose error code is
+/// `XPTY0004`. The variant is also the "not comparable" signal that
+/// [`is_operator_not_defined`] tests, but that signal is only ever consulted on
+/// the result of a *comparison* (`compare_ge`/`compare_le` and the general
+/// comparisons), never on the result of an arithmetic operator, so the two uses
+/// do not interfere.
 fn unsupported_operator(op: BinaryOpKind, left: &XmlValue, right: &XmlValue) -> XPathError {
-    XPathError::internal(format!(
-        "Operator {:?} not defined for types {:?} and {:?}",
-        op, left.type_code, right.type_code
-    ))
+    XPathError::binary_operator_not_defined(
+        format!("{op:?}"),
+        type_code_to_name(left.type_code),
+        type_code_to_name(right.type_code),
+    )
 }
 
 #[cfg(test)]
@@ -3549,8 +3986,8 @@ mod tests {
         );
         let right = left.clone();
 
-        assert!(compare_ge(&left, &right).unwrap());
-        assert!(compare_le(&left, &right).unwrap());
+        assert!(compare_ge(&left, &right, CollationRef::Codepoint).unwrap());
+        assert!(compare_le(&left, &right, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -3574,8 +4011,8 @@ mod tests {
             },
         );
 
-        assert!(compare_eq(&left, &right).unwrap());
-        assert!(!compare_eq(&left, &different).unwrap());
+        assert!(compare_eq(&left, &right, CollationRef::Codepoint).unwrap());
+        assert!(!compare_eq(&left, &different, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -3583,7 +4020,7 @@ mod tests {
         let inner = XmlValue::string("hello");
         let left = XmlValue::new(XmlTypeCode::String, XmlValueKind::Union(Box::new(inner)));
         let right = XmlValue::string("hello");
-        assert!(compare_eq(&left, &right).unwrap());
+        assert!(compare_eq(&left, &right, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -3613,8 +4050,16 @@ mod tests {
         assert!(matches!(result, Err(XPathError::FORG0001 { .. })));
     }
 
+    /// A general comparison with no true pair reports the incomparable pair.
+    ///
+    /// XPath 2.0 §3.5.2 defers the comparison of a pair to the corresponding
+    /// value comparison, and §3.5.1 makes an operand combination that no
+    /// operator mapping covers a type error. `xs:boolean` against `xs:date` is
+    /// such a combination, so the comparison is an error rather than `false` —
+    /// the same outcome `test_general_gt_iter_type_mismatch_errors` asserts for
+    /// `gt`.
     #[test]
-    fn test_general_eq_iter_type_mismatch_is_false() {
+    fn test_general_eq_iter_type_mismatch_errors() {
         let names = NameTable::new();
         let context = XPathContext::new(&names);
         let left: VecNodeIterator<RoXmlNavigator<'static>> =
@@ -3622,7 +4067,44 @@ mod tests {
         let right: VecNodeIterator<RoXmlNavigator<'static>> =
             VecNodeIterator::new(vec![XmlItem::Atomic(date_value(2024, 1, 1))]);
 
-        assert!(!general_eq_iter(&context, &left, &right).unwrap());
+        let result = general_eq_iter(&context, &left, &right);
+        assert!(matches!(
+            result,
+            Err(XPathError::BinaryOperatorNotDefined { .. })
+        ));
+        assert_eq!(result.unwrap_err().error_code(), Some("XPTY0004"));
+    }
+
+    /// The same for `!=`: an incomparable pair is not an unequal pair.
+    #[test]
+    fn test_general_ne_iter_type_mismatch_errors() {
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+        let left: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::boolean(true))]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(date_value(2024, 1, 1))]);
+
+        let result = general_ne_iter(&context, &left, &right);
+        assert_eq!(result.unwrap_err().error_code(), Some("XPTY0004"));
+    }
+
+    /// A true pair still short-circuits past an incomparable one (§3.5.2:
+    /// "an implementation may return true as soon as it finds an item in the
+    /// first operand and an item in the second operand that have the required
+    /// magnitude relationship").
+    #[test]
+    fn test_general_eq_iter_true_pair_wins_over_incomparable_pair() {
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+        let left: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(date_value(2024, 1, 1)),
+        ]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::integer(BigInt::from(1)))]);
+
+        assert!(general_eq_iter(&context, &left, &right).unwrap());
     }
 
     #[test]
@@ -3841,7 +4323,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::Boolean);
         assert_eq!(r.type_code, XmlTypeCode::Boolean);
-        assert!(compare_eq(&l, &r).unwrap());
+        assert!(compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -3852,7 +4334,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.as_boolean(), Some(false));
         assert_eq!(r.as_boolean(), Some(true));
-        assert!(!compare_eq(&l, &r).unwrap());
+        assert!(!compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -3863,7 +4345,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralLt, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::Double);
         assert_eq!(r.type_code, XmlTypeCode::Double);
-        assert!(compare_lt(&l, &r).unwrap());
+        assert!(compare_lt(&l, &r, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -3874,7 +4356,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::String);
         assert_eq!(r.type_code, XmlTypeCode::String);
-        assert!(!compare_eq(&l, &r).unwrap());
+        assert!(!compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -3885,7 +4367,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::Double);
         assert_eq!(r.type_code, XmlTypeCode::Double);
-        assert!(compare_eq(&l, &r).unwrap());
+        assert!(compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! storage and reference by ID. This approach avoids recursive ownership issues
 //! and enables efficient tree manipulation.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::xpath::ast::AstNode;
 
 /// Unique identifier for an AST node within an arena.
@@ -66,16 +68,56 @@ impl SourceSpan {
 ///
 /// Nodes are stored in a contiguous vector and referenced by `AstNodeId`.
 /// This enables efficient allocation and avoids recursive Box structures.
-#[derive(Debug, Default, Clone)]
 pub struct AstArena {
     nodes: Vec<AstNode>,
+    /// What this arena's node ids mean, as a number no other arena — live or
+    /// dropped — ever carries; see [`serial`](Self::serial).
+    serial: u64,
+}
+
+/// Source of [`AstArena::serial`]. Starts at 1, so that 0 can stand for "no
+/// arena" in a cache that has not seen one yet.
+static NEXT_ARENA_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn next_arena_serial() -> u64 {
+    NEXT_ARENA_SERIAL.fetch_add(1, Ordering::Relaxed)
+}
+
+impl std::fmt::Debug for AstArena {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AstArena")
+            .field("nodes", &self.nodes)
+            .finish()
+    }
+}
+
+impl Default for AstArena {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for AstArena {
+    /// A clone can be changed independently of the original, so it is a
+    /// different arena and gets its own serial.
+    fn clone(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            serial: next_arena_serial(),
+        }
+    }
 }
 
 impl AstArena {
     /// Create a new empty arena.
     #[inline]
     pub fn new() -> Self {
-        Self { nodes: Vec::new() }
+        Self {
+            nodes: Vec::new(),
+            serial: next_arena_serial(),
+        }
     }
 
     /// Create an arena with pre-allocated capacity.
@@ -83,7 +125,21 @@ impl AstArena {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             nodes: Vec::with_capacity(capacity),
+            serial: next_arena_serial(),
         }
+    }
+
+    /// An identity of this arena's contents that no other arena shares.
+    ///
+    /// A run keys what it caches about an AST node by this serial and the node
+    /// id. An address would not do: once an arena is dropped, a new one can be
+    /// allocated at the same address and would then be answered from the old
+    /// one's entries. Every arena gets a fresh serial when it is created or
+    /// cloned, and again whenever it is changed through `&mut self` (so node ids
+    /// that may now mean something else are never matched with old entries).
+    #[inline]
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// Add a node to the arena and return its ID.
@@ -91,6 +147,7 @@ impl AstArena {
     pub fn add(&mut self, node: AstNode) -> AstNodeId {
         let id = self.nodes.len() as AstNodeId;
         self.nodes.push(node);
+        self.serial = next_arena_serial();
         id
     }
 
@@ -109,6 +166,7 @@ impl AstArena {
     /// Panics if the ID is out of bounds.
     #[inline]
     pub fn get_mut(&mut self, id: AstNodeId) -> &mut AstNode {
+        self.serial = next_arena_serial();
         &mut self.nodes[id as usize]
     }
 
@@ -121,6 +179,7 @@ impl AstArena {
     /// Try to get a mutable reference to a node by ID.
     #[inline]
     pub fn try_get_mut(&mut self, id: AstNodeId) -> Option<&mut AstNode> {
+        self.serial = next_arena_serial();
         self.nodes.get_mut(id as usize)
     }
 
@@ -140,6 +199,7 @@ impl AstArena {
     #[inline]
     pub fn clear(&mut self) {
         self.nodes.clear();
+        self.serial = next_arena_serial();
     }
 
     /// Iterate over all nodes in the arena.

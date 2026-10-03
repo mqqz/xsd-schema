@@ -455,22 +455,90 @@ fn cast_to_double(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPathE
 
 /// Parse a float string, handling special values like INF and NaN.
 fn parse_float_with_special(s: &str) -> Result<f32, ()> {
-    match s {
-        "INF" => Ok(f32::INFINITY),
-        "-INF" => Ok(f32::NEG_INFINITY),
-        "NaN" => Ok(f32::NAN),
-        _ => s.parse::<f32>().map_err(|_| ()),
-    }
+    parse_xsd_float(s).ok_or(())
 }
 
 /// Parse a double string, handling special values like INF and NaN.
 fn parse_double_with_special(s: &str) -> Result<f64, ()> {
+    parse_xsd_double(s).ok_or(())
+}
+
+/// The `xs:double` whose lexical form is `lexical`, or `None` when it is not
+/// one.
+///
+/// The lexical space (XSD 1.1 Part 2 §3.3.5): a decimal mantissa with an
+/// optional sign and an optional exponent, or one of `INF`, `+INF`, `-INF`,
+/// `NaN` — spelled exactly so. Surrounding XML whitespace is collapsed away
+/// first (the type's `whiteSpace` facet is `collapse`). Rust's own `f64` parser
+/// is not used on its own because it also accepts `inf`, `infinity`, `nan`,
+/// `-NaN` and friends in any case; XPath 2.0 Appendix I.1 is explicit that
+/// "the strings Infinity and -Infinity … cause a dynamic error when
+/// compatibility mode is set to false" (and convert to NaN under `fn:number`).
+///
+/// Every conversion of a string or `xs:untypedAtomic` to `xs:double` in the
+/// engine goes through this — `cast`, `fn:number`, arithmetic, comparisons,
+/// `fn:sum`/`fn:avg`/`fn:min`/`fn:max` — so they all agree on what is a number.
+pub(crate) fn parse_xsd_double(lexical: &str) -> Option<f64> {
+    let s = trim_xml_whitespace(lexical);
     match s {
-        "INF" => Ok(f64::INFINITY),
-        "-INF" => Ok(f64::NEG_INFINITY),
-        "NaN" => Ok(f64::NAN),
-        _ => s.parse::<f64>().map_err(|_| ()),
+        "INF" | "+INF" => Some(f64::INFINITY),
+        "-INF" => Some(f64::NEG_INFINITY),
+        "NaN" => Some(f64::NAN),
+        _ if is_xsd_numeral(s) => s.parse().ok(),
+        _ => None,
     }
+}
+
+/// [`parse_xsd_double`] for `xs:float`, which has the same lexical space.
+pub(crate) fn parse_xsd_float(lexical: &str) -> Option<f32> {
+    let s = trim_xml_whitespace(lexical);
+    match s {
+        "INF" | "+INF" => Some(f32::INFINITY),
+        "-INF" => Some(f32::NEG_INFINITY),
+        "NaN" => Some(f32::NAN),
+        _ if is_xsd_numeral(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn trim_xml_whitespace(s: &str) -> &str {
+    s.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
+}
+
+/// Whether `s` is `(\+|-)?([0-9]+(\.[0-9]*)?|\.[0-9]+)([Ee](\+|-)?[0-9]+)?` — the
+/// numeric (non-special) part of the `xs:double` / `xs:float` lexical space.
+fn is_xsd_numeral(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while *i < bytes.len() && bytes[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i - start
+    };
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let integer_digits = digits(&mut i);
+    let mut fraction_digits = 0;
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        fraction_digits = digits(&mut i);
+    }
+    if integer_digits == 0 && fraction_digits == 0 {
+        return false;
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if digits(&mut i) == 0 {
+            return false;
+        }
+    }
+    i == bytes.len()
 }
 
 /// Treat a value as a specific type (type assertion without conversion).
@@ -573,41 +641,106 @@ fn is_integer_derived(code: XmlTypeCode) -> bool {
     )
 }
 
+/// The base type of a built-in atomic type.
+///
+/// One step up the built-in hierarchy of XSD Datatypes §3, extended with the
+/// two types XPath 2.0 adds to it: `xs:untypedAtomic`, which derives directly
+/// from `xs:anyAtomicType` (XDM §2.6) and is **not** a string, and
+/// `xs:anyAtomicType` itself, which is where the walk stops.
+///
+/// Returns `None` for `xs:anyAtomicType` and for every code that is not a
+/// built-in atomic type (nodes, the ur-types, the list types, `xs:error`).
+fn builtin_base_type(code: XmlTypeCode) -> Option<XmlTypeCode> {
+    use XmlTypeCode as T;
+    Some(match code {
+        // §3.3: the 19 primitives, plus xs:untypedAtomic, derive from
+        // xs:anyAtomicType directly.
+        T::UntypedAtomic
+        | T::String
+        | T::Boolean
+        | T::Decimal
+        | T::Float
+        | T::Double
+        | T::Duration
+        | T::DateTime
+        | T::Time
+        | T::Date
+        | T::GYearMonth
+        | T::GYear
+        | T::GMonthDay
+        | T::GDay
+        | T::GMonth
+        | T::HexBinary
+        | T::Base64Binary
+        | T::AnyUri
+        | T::QName
+        | T::Notation => T::AnyAtomicType,
+
+        // §3.4.1-§3.4.9: the xs:string branch.
+        T::NormalizedString => T::String,
+        T::Token => T::NormalizedString,
+        T::Language | T::NmToken | T::Name => T::Token,
+        T::NCName => T::Name,
+        T::Id | T::IdRef | T::Entity => T::NCName,
+
+        // §3.4.13-§3.4.25: the xs:decimal branch.
+        T::Integer => T::Decimal,
+        T::NonPositiveInteger | T::Long | T::NonNegativeInteger => T::Integer,
+        T::NegativeInteger => T::NonPositiveInteger,
+        T::Int => T::Long,
+        T::Short => T::Int,
+        T::Byte => T::Short,
+        T::UnsignedLong | T::PositiveInteger => T::NonNegativeInteger,
+        T::UnsignedInt => T::UnsignedLong,
+        T::UnsignedShort => T::UnsignedInt,
+        T::UnsignedByte => T::UnsignedShort,
+
+        // §3.4.26/§3.4.27: the two duration subtypes; §3.4.28: xs:dateTimeStamp.
+        T::YearMonthDuration | T::DayTimeDuration => T::Duration,
+        T::DateTimeStamp => T::DateTime,
+
+        _ => return None,
+    })
+}
+
 /// Check if a source type matches a target type for type checking.
 ///
-/// This handles type compatibility rules including:
-/// - Exact type match
-/// - anyAtomicType matches any atomic type
-/// - String derived types match string
-/// - Integer derived types match integer
+/// This is SequenceType matching for an AtomicType item type (XPath 2.0
+/// §2.5.4): the value's type must be the named type itself or a type derived
+/// from it by restriction. The relation is computed by walking
+/// `builtin_base_type` up to `xs:anyAtomicType`, so every branch of the
+/// built-in hierarchy is modelled, not just the string and numeric ones.
+///
+/// Two consequences worth naming, because they used to be wrong:
+/// `xs:untypedAtomic` is **not** an `xs:string` (it derives from
+/// `xs:anyAtomicType`), and `xs:dayTimeDuration` and `xs:yearMonthDuration`
+/// **are** `xs:duration`s.
 pub fn type_matches(source: XmlTypeCode, target: XmlTypeCode) -> bool {
     if source == target {
         return true;
     }
 
-    // anyAtomicType matches any atomic type
-    if target == XmlTypeCode::AnyAtomicType {
-        return source.is_atomic();
-    }
-
-    // Item matches everything
+    // item() matches every item.
     if target == XmlTypeCode::Item {
         return true;
     }
 
-    // String type hierarchy
-    if target == XmlTypeCode::String {
-        return source.is_string_derived() || source == XmlTypeCode::UntypedAtomic;
+    // Only an atomic value participates in the built-in atomic hierarchy.
+    if !source.is_atomic() {
+        return false;
     }
 
-    // Integer type hierarchy
-    if target == XmlTypeCode::Integer {
-        return is_integer_derived(source);
+    // xs:anyAtomicType is the root of that hierarchy.
+    if target == XmlTypeCode::AnyAtomicType {
+        return true;
     }
 
-    // Decimal type hierarchy (includes integer)
-    if target == XmlTypeCode::Decimal {
-        return source == XmlTypeCode::Decimal || is_integer_derived(source);
+    let mut current = source;
+    while let Some(base) = builtin_base_type(current) {
+        if base == target {
+            return true;
+        }
+        current = base;
     }
 
     false
@@ -1316,5 +1449,180 @@ mod tests {
         let value = XmlValue::string("P0Y0M");
         let result = cast_to(&value, XmlTypeCode::YearMonthDuration).unwrap();
         assert_eq!(result.to_string_value(), "P0M");
+    }
+
+    // =========================================================================
+    // SequenceType matching over the built-in atomic type hierarchy
+    // =========================================================================
+
+    /// Every built-in atomic type, with its expected base type. This is the
+    /// XSD Datatypes §3 hierarchy plus the two types XPath 2.0 adds to it
+    /// (`xs:untypedAtomic` under `xs:anyAtomicType`, and `xs:anyAtomicType`
+    /// itself as the root).
+    const ATOMIC_HIERARCHY: &[(XmlTypeCode, Option<XmlTypeCode>)] = &[
+        (XmlTypeCode::UntypedAtomic, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::String, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::Boolean, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::Decimal, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::Float, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::Double, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::Duration, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::DateTime, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::Time, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::Date, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::GYearMonth, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::GYear, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::GMonthDay, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::GDay, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::GMonth, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::HexBinary, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::Base64Binary, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::AnyUri, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::QName, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::Notation, Some(XmlTypeCode::AnyAtomicType)),
+        (XmlTypeCode::NormalizedString, Some(XmlTypeCode::String)),
+        (XmlTypeCode::Token, Some(XmlTypeCode::NormalizedString)),
+        (XmlTypeCode::Language, Some(XmlTypeCode::Token)),
+        (XmlTypeCode::NmToken, Some(XmlTypeCode::Token)),
+        (XmlTypeCode::Name, Some(XmlTypeCode::Token)),
+        (XmlTypeCode::NCName, Some(XmlTypeCode::Name)),
+        (XmlTypeCode::Id, Some(XmlTypeCode::NCName)),
+        (XmlTypeCode::IdRef, Some(XmlTypeCode::NCName)),
+        (XmlTypeCode::Entity, Some(XmlTypeCode::NCName)),
+        (XmlTypeCode::Integer, Some(XmlTypeCode::Decimal)),
+        (XmlTypeCode::NonPositiveInteger, Some(XmlTypeCode::Integer)),
+        (
+            XmlTypeCode::NegativeInteger,
+            Some(XmlTypeCode::NonPositiveInteger),
+        ),
+        (XmlTypeCode::Long, Some(XmlTypeCode::Integer)),
+        (XmlTypeCode::Int, Some(XmlTypeCode::Long)),
+        (XmlTypeCode::Short, Some(XmlTypeCode::Int)),
+        (XmlTypeCode::Byte, Some(XmlTypeCode::Short)),
+        (XmlTypeCode::NonNegativeInteger, Some(XmlTypeCode::Integer)),
+        (
+            XmlTypeCode::UnsignedLong,
+            Some(XmlTypeCode::NonNegativeInteger),
+        ),
+        (XmlTypeCode::UnsignedInt, Some(XmlTypeCode::UnsignedLong)),
+        (XmlTypeCode::UnsignedShort, Some(XmlTypeCode::UnsignedInt)),
+        (XmlTypeCode::UnsignedByte, Some(XmlTypeCode::UnsignedShort)),
+        (
+            XmlTypeCode::PositiveInteger,
+            Some(XmlTypeCode::NonNegativeInteger),
+        ),
+        (XmlTypeCode::YearMonthDuration, Some(XmlTypeCode::Duration)),
+        (XmlTypeCode::DayTimeDuration, Some(XmlTypeCode::Duration)),
+        (XmlTypeCode::DateTimeStamp, Some(XmlTypeCode::DateTime)),
+        (XmlTypeCode::AnyAtomicType, None),
+    ];
+
+    /// The transitive closure of a type's base chain, including the type itself.
+    fn ancestors(code: XmlTypeCode) -> Vec<XmlTypeCode> {
+        let mut chain = vec![code];
+        let mut current = code;
+        loop {
+            let base = ATOMIC_HIERARCHY
+                .iter()
+                .find(|(c, _)| *c == current)
+                .and_then(|(_, b)| *b);
+            match base {
+                Some(b) => {
+                    chain.push(b);
+                    current = b;
+                }
+                None => return chain,
+            }
+        }
+    }
+
+    /// `type_matches(source, target)` must be exactly "source is target, or is
+    /// derived from target by restriction", for every pair of built-in atomic
+    /// types.
+    #[test]
+    fn type_matches_is_the_builtin_atomic_hierarchy() {
+        for (source, _) in ATOMIC_HIERARCHY {
+            let expected = ancestors(*source);
+            for (target, _) in ATOMIC_HIERARCHY {
+                // xs:anyAtomicType is abstract: no value has it as its type, so
+                // it is only ever a target here.
+                if *source == XmlTypeCode::AnyAtomicType && *target != XmlTypeCode::AnyAtomicType {
+                    continue;
+                }
+                let want = expected.contains(target);
+                assert_eq!(
+                    type_matches(*source, *target),
+                    want,
+                    "type_matches({source:?}, {target:?}) should be {want}"
+                );
+            }
+        }
+    }
+
+    /// The two entries the old hand-written table got wrong.
+    #[test]
+    fn untyped_atomic_is_not_a_string_and_durations_are_durations() {
+        // XDM: xs:untypedAtomic derives from xs:anyAtomicType, not xs:string.
+        assert!(!type_matches(
+            XmlTypeCode::UntypedAtomic,
+            XmlTypeCode::String
+        ));
+        assert!(!type_matches(
+            XmlTypeCode::UntypedAtomic,
+            XmlTypeCode::NormalizedString
+        ));
+        assert!(type_matches(
+            XmlTypeCode::UntypedAtomic,
+            XmlTypeCode::AnyAtomicType
+        ));
+        // …and no string type is an xs:untypedAtomic either.
+        assert!(!type_matches(
+            XmlTypeCode::String,
+            XmlTypeCode::UntypedAtomic
+        ));
+
+        // XSD Datatypes §3.4.26/§3.4.27.
+        assert!(type_matches(
+            XmlTypeCode::DayTimeDuration,
+            XmlTypeCode::Duration
+        ));
+        assert!(type_matches(
+            XmlTypeCode::YearMonthDuration,
+            XmlTypeCode::Duration
+        ));
+        assert!(!type_matches(
+            XmlTypeCode::Duration,
+            XmlTypeCode::DayTimeDuration
+        ));
+        assert!(!type_matches(
+            XmlTypeCode::DayTimeDuration,
+            XmlTypeCode::YearMonthDuration
+        ));
+    }
+
+    /// `item()` still matches everything, and a node type never enters the
+    /// atomic hierarchy.
+    #[test]
+    fn type_matches_outside_the_atomic_hierarchy() {
+        for code in [
+            XmlTypeCode::Element,
+            XmlTypeCode::Attribute,
+            XmlTypeCode::Document,
+            XmlTypeCode::String,
+            XmlTypeCode::UntypedAtomic,
+        ] {
+            assert!(type_matches(code, XmlTypeCode::Item));
+        }
+        assert!(!type_matches(XmlTypeCode::Element, XmlTypeCode::String));
+        assert!(!type_matches(
+            XmlTypeCode::Element,
+            XmlTypeCode::AnyAtomicType
+        ));
+        // The list types are not atomic.
+        assert!(!type_matches(
+            XmlTypeCode::IdRefs,
+            XmlTypeCode::AnyAtomicType
+        ));
+        assert!(!type_matches(XmlTypeCode::IdRefs, XmlTypeCode::IdRef));
     }
 }

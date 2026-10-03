@@ -7,8 +7,293 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-03
+
+### Behaviour changes
+
+This release removes no public item and changes no signature, but it fixes a
+large number of XPath 2.0 conformance defects, and some expressions now give a
+different, correct answer or raise an error where they used to return one.
+This list names them by theme; each point is detailed under *Fixed*, or under
+*Added* where it says so.
+
+- **Validation outcome.** An element's PSVI `[validity]`, and so
+  `DriveOutcome::root_validity` and the validity an end-element event reports,
+  now reflects its children, attributes and identity constraints and, for the
+  validation root, the ID/IDREF table. An instance with an invalid descendant
+  — a bad value, a failing assertion, a duplicate key, a dangling IDREF and so
+  on — used to report the error but leave the root `Valid`; the root is now
+  `Invalid`. Errors inside a laxly assessed subtree still leave it as it was.
+  Which errors are reported is unchanged.
+- **Paths and axes.** `/` evaluates its right-hand operand once per node, so
+  results come in document order without duplicates and `//t[1]` selects the
+  first `t` child of each parent rather than the first `t` in the document. An
+  abbreviated `attribute(…)` step uses the attribute axis; `following::` no
+  longer skips subtrees; `preceding::` is delivered in reverse document order,
+  and the root has none; a name test selects only nodes of its axis's
+  principal node kind, and works on the `namespace::` axis; in a step, the
+  name of `element(N)` / `attribute(N)` and the type of `element(N, T)` /
+  `attribute(N, T)` are honoured and `schema-element(N)` /
+  `schema-attribute(N)` are declaration-aware; `xmlns=""` is no longer exposed
+  as a namespace node. A leading `/` or `//` raises `XPDY0050` when the root of
+  the context node's tree is not a document node.
+- **New static errors** — the expression no longer compiles: a QName used as
+  an `AtomicType` that is not an atomic type (`XPST0051`); `xs:NOTATION` or
+  `xs:anyAtomicType` as the target of `cast as` or `castable as` (`XPST0080`);
+  a `TypeName` in `element(N, T)` / `attribute(N, T)` that is neither a
+  built-in type nor a type of the static context's schema set (`XPST0008`),
+  which without a schema set is any name outside the XML Schema namespace; an
+  unbound prefix inside a kind test (`XPST0081`); a numeric literal whose
+  exponent has no digits, such as `1e` (`XPST0003`).
+- **New dynamic and type errors.** An operator applied to operand types XPath
+  2.0 does not define raises `XPTY0004`, and a general comparison no longer
+  reports `false` for such a pair; unary `+` on a non-numeric operand, which
+  returned it unchanged, raises `XPTY0004` too. An operand or built-in
+  function argument of more than one item where at most one is allowed, and an
+  operand of `is`, `<<` or `>>` holding more than one node, raise `XPTY0004`
+  instead of `XPDY0050`; `fn:name`, `fn:root` and the other functions with a
+  `node()?` parameter raise `XPTY0004` for several nodes or an atomic value
+  instead of using the first node or answering as for the empty sequence.
+  `treat as` raises `XPDY0050` on every failure. `inf`, `Infinity` and `nan`
+  are no longer numbers (`FORG0001` in a cast, `NaN` from `fn:number`).
+  `fn:sum` and `fn:avg` of a number and a duration, or of the two duration
+  types, raise `FORG0006`; `idiv` raises `FOAR0002` for a NaN operand or an
+  infinite dividend. A `$collation` the host does not supply raises `FOCH0002`
+  instead of being ignored; `fn:tokenize` and `fn:replace` report an invalid
+  pattern, flags or replacement whatever the input; `fn:matches`,
+  `fn:replace` and `fn:tokenize` reject `(?` and the `q` flag;
+  `fn:resolve-uri` raises `FORG0002` for more unusable base URIs. In the other
+  direction, an `xs:untypedAtomic` operand of `to` is cast to `xs:integer`
+  instead of raising `XPTY0004`, and `() treat as empty-sequence()` succeeds.
+- **Atomization.** A list-typed node atomizes to one item per member, through
+  `compose::Value` as well; a namespace node to `xs:string`; an element of
+  mixed complex content (including `xs:anyType`) to `xs:untypedAtomic`, and
+  one of empty content to the empty sequence; a nilled element makes a value
+  comparison or arithmetic return the empty sequence; built-in functions
+  atomize their arguments instead of reading the string value.
+- **Functions.** `fn:index-of` and `fn:distinct-values` compare with `eq`
+  (`index-of(xs:token('a'), 'a')` is now `1`); `fn:tokenize` keeps
+  zero-length tokens; `fn:sum` keeps `xs:integer`, and `sum((), ())` is the
+  empty sequence; `fn:min` and `fn:max` accept every ordered type and return
+  NaN in the numbers' common type; `fn:round-half-to-even` decides a tie on
+  the exact value and no longer returns NaN for a large precision;
+  `fn:namespace-uri-for-prefix` returns the empty sequence for an unbound
+  prefix; `fn:id` follows F&O §15.5.2 (normalized values, XML-whitespace
+  tokens, `xs:ID`-typed attributes, `FODC0001` outside a document);
+  `fn:deep-equal` follows F&O §15.3.1; `fn:nilled` reads the PSVI property;
+  `fn:base-uri` of namespace and parentless attribute nodes, the error codes
+  of `fn:resolve-QName` and `fn:subsequence` with infinite or NaN arguments
+  are corrected.
+- **SequenceType matching.** `xs:untypedAtomic` is no longer an `xs:string`,
+  and `xs:dayTimeDuration` and `xs:yearMonthDuration` are `xs:duration`s; the
+  `TypeName` of `element(N, T)` / `attribute(N, T)` is matched in
+  `instance of` and `treat as`, so an untyped node no longer matches an
+  ordinary schema type.
+- **Lexer.** String literals are no longer entity-decoded a second time;
+  `for`, `some` and `every` are ordinary names where the grammar allows one;
+  `p:*` and `5.` are accepted; `NCName` follows the XML 1.0 name productions.
+- **XSD 1.1 validation.** In an assertion the data model instance is cut at
+  the asserted element: `parent::`, `ancestor::`, `following::` and the
+  sibling axes no longer reach outside it, and `fn:id` finds the elements
+  inside it, where it used to find nothing. In the test of a type alternative,
+  whose data model instance is rooted at the element itself, a leading `/` or
+  `//` and `fn:id` now raise an error, so the test is false. Each can change
+  which type is selected or whether an instance is valid.
+- **Schema loading.** A relative schema location that starts with `..` keeps
+  it, so a different file may be read.
+- **XPath 1.0 compatibility.** `XPathMode::XPath10` applies XPath 1.0's
+  first-item rule to arithmetic: `1 + /doc/a` over two `a` elements adds the
+  first instead of raising `XPDY0050`.
+- **Documents and ids.** `xml:id` is indexed in a document built through the
+  push API and in a `Fragment` buffer too; `BufferDocument::get_element_by_id`
+  normalizes its argument, ignores values that are not NCNames and also finds
+  `xs:ID`-typed attributes; text parsing reports `DuplicateId` for values that
+  are equal after normalization (`"a"` and `" a"`) and no longer for repeated
+  values that are not NCNames; `BufferDocumentBuilder::register_xml_id`
+  accepts a repeat for the same element, works in a `Fragment` buffer and
+  panics on a node reference outside the document; `copy_attribute` keeps the
+  annotation, or lack of one, of the attribute that replaces another.
+- **Public helpers.** `xpath::functions::atomize_to_single_opt` and the
+  `atomize_to_*` helpers built on it raise `XPTY0004` instead of `XPDY0050`
+  for more than one item; `xpath::atomize::to_number` no longer accepts `inf`,
+  `Infinity` or `nan`; `BufferDocNavigator::typed_value` returns
+  `TypedValue::Untyped` for mixed and an empty value for empty complex content
+  instead of `TypedValue::Absent`; `RoXmlNavigator::name` returns the
+  qualified name; `XPathValue::as_slice` returns a one-element slice for a
+  single item.
+
+### Added
+
+- Collations. The module `xpath::collation` with the trait `Collation`, the
+  trait `CollationResolver` and the constant `CODEPOINT_COLLATION_URI`, plus
+  `XPathContext::with_collation_resolver`,
+  `XPathContext::with_default_collation` and
+  `XPathContext::default_collation`. The Unicode codepoint collation is
+  implemented here and is still the default; every other collation is supplied
+  by the host through the resolver callback, so the crate takes no dependency
+  for collation data. A `Collation` need only implement `compare`; an optional
+  `equals` (by default `compare(a, b).is_eq()`) decides equality where that is
+  cheaper than ordering, an optional `sort_key` lets the engine keep answering
+  a general comparison with a hash index instead of comparing every pair, and
+  an optional `find` (with the provided `starts_with` and `ends_with`)
+  supplies the collation units that `fn:contains`, `fn:starts-with`,
+  `fn:ends-with`, `fn:substring-before` and `fn:substring-after` are defined
+  over — without it they raise `FOCH0004`.
+  The `$collation` argument of `fn:compare`, `fn:contains`, `fn:starts-with`,
+  `fn:ends-with`, `fn:substring-before`, `fn:substring-after`, `fn:index-of`,
+  `fn:distinct-values`, `fn:deep-equal`, `fn:min` and `fn:max`, and the static
+  context's default collation for the value and general comparisons (`eq`,
+  `lt`, `=`, `<`, …, including `=` and `!=` between strings in XPath 1.0
+  compatibility mode, which XPath 2.0 §3.5.2 evaluates with `eq` and `ne`),
+  now go through it; `fn:default-collation()` returns the
+  property rather than a constant. A relative collation URI is resolved
+  against the static base URI (F&O §7.3.1). Nothing changes under the
+  codepoint collation: it is answered without consulting the resolver, on the
+  same code path and at the same speed as before. `XPathError::error_code`
+  reports `FOCH0004` for the new error, which travels as an error QName;
+  `XPathError::collation_no_units` builds it. A comparison operator asks the
+  resolver for the default collation only when it actually compares two
+  strings — never for an evaluation that compares only numbers, dates or other
+  non-string values — and a function that takes a `$collation` argument asks
+  when it is called; within one evaluation run the answer is memoised. The
+  public `operators::general_eq_iter` and its siblings, which see only the
+  static context, ask at most once per call.
+- `XPathContext::with_xpath10_compatibility(bool)` and
+  `XPathContext::xpath10_compatibility()`. This is the static-context property
+  XPath 2.0 calls *XPath 1.0 compatibility mode*, and it is distinct from
+  `XPathMode::XPath10`, which is a *language* mode whose lexer and parser
+  reject XPath 2.0 syntax. The flag keeps the full 2.0 syntax and switches
+  only the semantics 2.0 itself defines differently when the property is
+  true: the 1.0 conversions in arithmetic (§3.4); the 1.0 rules in general
+  comparisons — an operand compared with a single boolean is converted, as a
+  whole, to its effective boolean value (§3.5.2), `<`, `<=`, `>` and `>=`
+  compare numbers, and `=` and `!=` compare numbers when either side is a
+  number and strings otherwise; and the first-item, `fn:string` and
+  `fn:number` conversions of a function argument whose declared type is a
+  single item (§3.1.5). The effective boolean value itself is not affected: a
+  sequence of two or more atomic values is `FORG0006` in `and`, `or`, a
+  predicate, `fn:boolean` or `fn:not` with the flag as without it (§2.4.3).
+  Hosts embedding the XPath engine need this when they run expressions
+  written for a 1.0-era host language while still accepting 2.0 syntax in the
+  same document. `XPathMode::XPath10` implies the property.
+- `BufferDocNavigator::new_orphan(doc, node)` — a navigator under which `node`
+  has **no parent**: `move_to_parent` returns `false` there, `move_to_root`
+  and `move_to_visible_root` land on it, and it has no siblings; its
+  descendants are unaffected. A `BufferDocument` always has a document node at
+  the root of its tree, but the XDM allows a parentless element, attribute,
+  comment, processing instruction or text node, and a host that constructs
+  such nodes has to build them somewhere. Under it `parent::`, `ancestor::`,
+  the sibling axes, `following::` and `preceding::` stop at `node`,
+  `fn:root()` lands on it, a leading `/` or `//` raises `XPDY0050` because the
+  root is not a document node, and `find_element_by_id` searches the subtree
+  of `node` only (`fn:id` itself raises `FODC0001` there, for the same
+  reason).
+  `new_assertion` cuts the same links at the asserted element, but keeps
+  `fn:root()` and the absolute paths on the hidden document node. The cut
+  applies to the node itself only: its attribute and namespace nodes keep it
+  as their parent, and the parentless view travels with `move_to`. On the
+  document node `new_orphan` is the ordinary navigator; it panics when `node`
+  is not a node of `doc`.
+- `BufferDocument::set_document_base_uri(uri)` and
+  `BufferDocument::document_base_uri()` — the **document-level base URI**, the
+  base URI a node reports once the walk up its `xml:base` ancestors reaches
+  the document node without finding one. A parser is handed bytes and cannot
+  know the URI a document was retrieved from, so a document built by
+  `from_reader` or by a `BufferDocumentBuilder` still starts with none and
+  `fn:base-uri` still falls back to the static base URI of the expression; a
+  host that does know records it here, and `fn:base-uri` and
+  `fn:document-uri` then report it, with any `xml:base` attribute on the node
+  or an ancestor still taking precedence and being resolved against it.
+- `BufferDocument::source_span(node_ref)` and
+  `BufferDocument::has_source_spans()`. The per-node byte ranges a document
+  records under `BufferDocumentOptions::track_source_locations` were only
+  reachable from inside the crate; a host that parses a document and wants to
+  report an error at a line and column of its own copy of the source text can
+  now read them.
+- `xpath::functions::special::error` — an implementation of `fn:error` for
+  arities 0 to 3, which raises a dynamic error identified by the supplied
+  QName, defaulting to `err:FOER0000`, and accepts and ignores
+  `$error-object`. The four declared signatures are enforced by the
+  implementation itself, because the engine does not check a registered
+  function's declared parameter types at evaluation time and a host may
+  register the function loosely: `$error` is one `xs:QName` in the
+  one-argument form and `xs:QName?` in the other two, and `$description` is
+  one `xs:string` — so `error(())`, `error((), 42)` and `error((), ())` are
+  `XPTY0004`, while `error((), 'why')` raises `FOER0000`. It is **opt-in**: the
+  built-in catalog does not contain it, so `error()` in an expression is still
+  `XPST0017` until a host registers the function with `FunctionSet::register`,
+  for which its documentation carries a worked example that declares one
+  signature per arity.
+- `XPathError::raised`, `XPathError::raised_error` and the `RaisedError` type,
+  which carry a dynamic error identified by an arbitrary error QName — the one
+  `fn:error` raises, and the spec-defined codes that have no variant of their
+  own. `XPathError::error_code` resolves the codes listed in
+  `QNAMED_ERROR_CODES` — `FOER0000`, `FOCH0004`, `FODC0001`, `FONS0004`,
+  `FORG0002` and `XPST0080` — back to their `'static` string, and
+  `XPathError::no_namespace_for_prefix` builds `FONS0004`. The namespace and
+  the default local name are exposed as `XQT_ERRORS_NAMESPACE` and
+  `DEFAULT_RAISED_ERROR`. `RaisedError` is `#[non_exhaustive]`: a host reads
+  its fields but does not build one.
+- `BufferDocument::has_type_annotations` — a constant-time, exact answer to
+  "does any element or attribute of this document carry a schema type
+  annotation?", maintained where bindings are attached instead of computed by
+  walking the tree. It is `true` exactly when some node would report
+  `DomNavigator::type_annotation() == Some(_)`, and follows the annotation
+  mode of a copy.
+- `BufferDocument::get_element_by_id_in_tree(node, id)`, the id lookup scoped
+  to the tree containing `node`, answering with the first such element in
+  document order. A `DocumentKind::Full` document is one tree — every
+  top-level node, a comment or processing instruction before the document
+  element included, sits under its document node — so there it answers as
+  `get_element_by_id` does; in a `DocumentKind::Fragment` buffer each child of
+  the document node is a tree of its own. Passing the document node searches
+  the whole buffer, and a `node` that is not a node of the document answers
+  `None`.
+- An attribute whose typed value is a single `xs:ID` is now an is-id node,
+  found by `fn:id` and `BufferDocument::get_element_by_id`, not only `xml:id`
+  (XDM §6.3.4): its type is `xs:ID` or
+  derived from it, or a union whose value is of such a member, or a list of
+  `xs:ID` of length one — and the value is valid. That holds wherever the
+  attribute is annotated: in a document built by `build_typed_document`
+  (including a type chosen by XSD 1.1 conditional type assignment), in a
+  copy made with `Annotations::Preserve`, and wherever
+  `BufferDocumentBuilder::set_node_binding` binds an attribute. Binding it
+  again replaces what the earlier binding filed.
+- Five small public helpers that come with the path, node-test and URI fixes
+  below:
+  - `xpath::ast::default_forward_axis` — the axis an abbreviated forward step
+    runs on: `attribute` for an `attribute(…)` or `schema-attribute(…)` test,
+    `child` otherwise (XPath 2.0 §3.2.4);
+  - `xpath::ast::PathStepNode::abbrev_forward` — builds an abbreviated
+    forward step on that axis;
+  - `xpath::node_test::principal_node_kind` — the principal node kind of an
+    axis: attribute for `attribute::`, namespace for `namespace::`, element
+    for every other axis (§3.2.1.1);
+  - `xpath::node_test::name_test_for_principal_kind` — the runtime node test
+    for a name test that selects only nodes of that principal kind
+    (§3.2.1.2);
+  - `XPathError::invalid_uri_argument` — builds `FORG0002` for an argument
+    that is not a valid URI reference, carried as an error QName.
+
 ### Fixed
 
+- An element's `[validity]` now reflects its children, its attributes, its
+  identity constraints and — for the validation root — the ID/IDREF table, as
+  Structures §3.3.5.1 requires ("Neither its [children] nor its [attributes]
+  contains an information item … whose [validity] is invalid"). Before, an
+  error anywhere below the root was reported but `DriveOutcome::root_validity`
+  and every ancestor's end-element validity stayed `Valid`: an invalid child
+  value or attribute, a failing `xs:assert` or assertion facet on a nested
+  element, a type selected by a type alternative, a duplicate key or an
+  unmatched keyref (even one declared on the root), a duplicate ID or an
+  unresolved IDREF, text in element-only or empty content, content in a nilled
+  element, an abstract element declaration, an invalid `xsi:` attribute value,
+  an undeclared ENTITY value. Each now makes the element it judges invalid, and
+  an invalid element makes its parent invalid. An element that is only laxly
+  assessed (no declaration and no type, e.g. matched by a `lax` wildcard)
+  stays `notKnown` and does not pass invalidity on, so errors inside such a
+  subtree are still reported while the root can remain `Valid`. Which errors
+  are reported is unchanged.
 - Relative schema locations keep a leading `..`. Path normalization let every
   `..` remove the component before it, and on a relative path with nothing
   left to remove the `..` was silently dropped, so
@@ -18,6 +303,604 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `schemas/a.xsd` read `common.xsd` instead of `../common.xsd`. A `..` now
   cancels only a preceding directory name; it is kept at the start of a
   relative path and, as before, dropped at the root of an absolute one.
+- `fn:contains`, `fn:starts-with`, `fn:ends-with`, `fn:substring-before` and
+  `fn:substring-after` no longer ignore their `$collation` argument. They
+  atomized it and dropped it, so a call naming any collation at all was
+  answered under the codepoint collation and a collation the implementation
+  does not support went unreported. They now use the collation, and a URI the
+  implementation does not support raises `FOCH0002` as F&O §7.3.1 requires.
+  `fn:index-of`, `fn:distinct-values`, `fn:min` and `fn:max` ignored theirs in
+  the same way and likewise use it now — `fn:min` and `fn:max` only for
+  `xs:string` items, since F&O §15.4.3 ignores the collation for every other
+  type.
+- A name test on the `namespace::` axis now selects namespace nodes. The
+  principal node kind of that axis is namespace, and a namespace node's name is
+  its prefix, in no namespace — but the name-test matcher rejected every node
+  that was not an element or an attribute, so `namespace::*` and
+  `namespace::p` always returned the empty sequence.
+- The lexer now accepts `NCName ":" "*"`, the second alternative of the
+  Wildcard production. `*:NCName` already lexed and the grammar already had the
+  production, but `p:*` failed with a lexer error in every position.
+- `TimSort::merge_hi` no longer panics in a debug build. The algorithm walks
+  its cursors backwards and deliberately lets two of them step one position
+  past the front of the array, which is the reference implementation's `-1`
+  sentinel; with `usize` indices that is wrapping arithmetic, and a plain
+  subtraction panicked under `cargo test` without `--release` while the
+  release build was already correct. Sorting a node sequence in a debug build
+  could hit it.
+- `for`, `some` and `every` are no longer treated as reserved words. They are
+  keywords only when a variable follows, so `@for`, `some:a` and an element
+  named `every` now lex as ordinary names instead of failing to parse.
+- The operands of the `to` operator now follow the function conversion rules
+  (XPath 2.0 §3.3.1): an `xs:untypedAtomic` operand is cast to `xs:integer`
+  instead of raising `XPTY0004`, which matters for a range whose bound comes
+  from an untyped node.
+- An abbreviated forward step whose node test is an `attribute(...)` or
+  `schema-attribute(...)` test now runs on the **attribute** axis. XPath 2.0
+  §3.2.4: "If the axis name is omitted from an axis step, the default axis is
+  `child` unless the axis step contains an AttributeTest or
+  SchemaAttributeTest; in that case, the default axis is `attribute`." Such a
+  step was given the child axis, so `/doc/attribute()` and `//attribute()`
+  always selected nothing.
+- The name of an `element(N)` or `attribute(N)` test used as a step's node
+  test is now matched instead of ignored, so `child::element(p)` selects only
+  `p` children. Previously the name was parsed and dropped and the test
+  behaved as bare `element()` / `attribute()`. (Reachable for attribute names
+  only since the previous entry.)
+- A name test now selects only nodes of the **principal node kind** of its
+  axis (XPath 2.0 §3.2.1.1, §3.2.1.2: "A name test is true if and only if the
+  kind of the node is the principal node kind for the step axis and the
+  expanded QName of the node is equal ... to the expanded QName specified by
+  the name test"). `self::*` and `ancestor-or-self::*` used to select
+  attribute nodes.
+- An unprefixed QName in a step's name test picks up the default
+  element/type namespace only on an axis whose principal node kind is element
+  (§3.2.1.2); on the `attribute::` and `namespace::` axes it is in no
+  namespace. Binding already applied this rule, but the unbound fallback path
+  did not.
+- The `following::` axis no longer skips the subtrees of the nodes it
+  reaches. Only the *context node's* descendants are off the axis
+  (§3.2.1.1), so the subtree escape now happens once, at the start, and the
+  walk continues in plain document order. From an attribute or namespace
+  node the axis now starts at the owner element's first child, which is the
+  first node after the context node in document order.
+- The `preceding::` axis is now delivered in **reverse document order**, the
+  order a positional predicate's focus counts in on a reverse axis, so
+  `preceding::x[1]` selects the nearest preceding `x` rather than the
+  furthest. The sequence returned by a path expression is still in document
+  order.
+- The `preceding::` axis of the root of a tree is now the empty sequence
+  instead of the whole tree: every node of the tree is a descendant of the
+  root and therefore follows it in document order.
+- A namespace **undeclaration** (`xmlns=""`, or `xmlns:p=""` under Namespaces
+  1.1) is no longer exposed as a namespace node with a zero-length URI. It is
+  the absence of a binding, so it disappears from the `namespace::` axis and
+  from `fn:in-scope-prefixes` while still shadowing the outer binding for
+  that prefix. The declaration remains visible to serialization, to shallow
+  copy, and to the namespace context that resolves QNames during validation,
+  which all model declarations rather than namespace nodes.
+- The `/` operator now evaluates its right-hand operand once per node of its
+  left-hand operand, with the inner focus XPath 2.0 §3.2 and §2.1.2 prescribe.
+  The whole operation was applied to the concatenated left-hand sequence, with
+  three consequences, all fixed: a step's predicates saw that concatenation
+  instead of the sequence the step produced for one context node, so
+  `a/b[last()]` returned only the last `b` of the last `a` and `a/b[1]` only
+  the first `b` of the first `a`; `fn:position()` and `fn:last()` in a
+  non-predicate right-hand operand reported 1 instead of the item's position in
+  the left-hand sequence and that sequence's size; and the per-operation
+  "returned in document order" / "duplicate nodes are eliminated" rules were
+  applied at most once, at the end of the whole path, so
+  `(item[5],item[3])/@val` came back in the order written and
+  `(a,a)/b` returned every `b` twice. A right-hand operand whose evaluations
+  return both a node and an atomic value now raises `XPTY0018`, and a
+  non-node left-hand operand raises `XPTY0019` for every kind of right-hand
+  operand rather than only for axis steps. Note that `//x[1]` is, as the
+  specification defines it, the first `x` child of *each* node — not
+  `(//x)[1]`.
+- A leading `/` or `//` raises `XPDY0050` when the root of the tree that
+  contains the context node is not a document node, as XPath 2.0 §3.2
+  requires: "At evaluation time, if the root node above the context node is
+  not a document node, a dynamic error is raised [err:XPDY0050]". That is the
+  case under `BufferDocNavigator::new_orphan` for any node but the document
+  node, and in the test of an XSD 1.1 type alternative, whose data model
+  instance is rooted at the element itself (Structures §3.12.4). There `/`
+  used to select the element, so `/@kind = 'a'` could select a type; a test
+  that uses a leading `/` or `//` is now false, which is how §3.12.4 treats a
+  dynamic error. Assertion navigators are unaffected: their root is the
+  document node.
+- An operator applied to an operand combination that XPath 2.0 Appendix B.2
+  does not define now reports the specification's type error code. §3.4 and
+  §3.5.1 both say "a type error is raised [err:XPTY0004]", but
+  `XPathError::error_code()` returned `None` for
+  `BinaryOperatorNotDefined`/`UnaryOperatorNotDefined`, and the arithmetic path
+  raised an internal error instead of either, so `3 + '2'`,
+  `xs:gYear("2000") gt xs:gYear("2001")` and `xs:date("2000-01-01") * 2`
+  surfaced without a code. The two error variants and their `Display` text now
+  carry `XPTY0004`.
+- Unary `+` is `op:numeric-unary-plus`: an `xs:untypedAtomic` operand is cast
+  to `xs:double` (`FORG0001` when it cannot be), a non-numeric operand is
+  `XPTY0004`, and the result is an `xs:integer`, `xs:decimal`, `xs:float` or
+  `xs:double` (XPath 2.0 §3.4, F&O §6.2.7). It returned its operand unchanged,
+  so `+'3'` was the string `'3'`.
+- A general comparison no longer reports `false` (or, for `!=`, `true`) when a
+  pair of operands cannot be compared. `'001' = 1` and `'001' != 1` both raise
+  `XPTY0004`: §3.5.2 defers each pair to the corresponding value comparison and
+  §3.5.1 makes an operand combination outside B.2 a type error. The
+  specification's freedom to "return true as soon as it finds an item in the
+  first operand and an item in the second operand that have the required
+  magnitude relationship" is kept — the type error is only reported when no pair
+  compares true, so `(1,'a') = 1` is still `true`.
+- An operand of an arithmetic operator, a value comparison, `to` or `cast as`
+  that atomizes to more than one item now raises `XPTY0004` instead of the
+  generic "more than one item" dynamic error. All four sections state the same
+  rule: "If the atomized operand is a sequence of length greater than one, a
+  type error is raised [err:XPTY0004]" (§3.4, §3.5.1, §3.3.1 via the function
+  conversion rules, §3.10.2). `(2,3,4) eq (2,3)` reported `XPDY0050`.
+- A built-in function argument of more than one item where the parameter
+  allows at most one is `XPTY0004` (XPath 2.0 §3.1.5), and so is an operand of
+  `is`, `<<` or `>>` holding more than one node (§3.5.3): "Each operand must
+  be either a single node or an empty sequence; otherwise a type error is
+  raised [err:XPTY0004]". Both reported `XPDY0050`, which the evaluator now
+  raises only for `treat as` and a leading `/` or `//`: `string(('a','b'))`
+  and `upper-case(('a','b'))` are `XPTY0004`. `fn:name`, `fn:local-name`,
+  `fn:namespace-uri`, `fn:node-name`, `fn:nilled`, `fn:base-uri`,
+  `fn:document-uri` and `fn:root` raise `XPTY0004` for more than one node, for
+  an atomic argument and, called without an argument, for an atomic context
+  item, where they used the first node or answered as for the empty sequence:
+  `name(/doc/a)` over two `a` elements returned `a`, and `local-name(1)` the
+  empty string. The public helper `xpath::functions::atomize_to_single_opt`,
+  and the `atomize_to_*` helpers built on it, report `XPTY0004` for more than
+  one item as well.
+- `treat as` now raises `XPDY0050` on every failure path, not `XPTY0004`.
+  §3.10.5: "If `expr1` matches `type1`, using the rules for SequenceType
+  matching, the `treat` expression returns the value of `expr1`; otherwise, it
+  raises a dynamic error [err:XPDY0050]" — which covers the wrong cardinality
+  as much as the wrong item type. `() treat as empty-sequence()` also stopped
+  failing: `empty-sequence()` carries no occurrence indicator of its own, so it
+  is no longer run through the cardinality check first.
+- A QName used as an `AtomicType` that does not name an atomic type in the
+  in-scope schema types is now the static error `XPST0051` (§2.5.4.2, §3.10.2,
+  §3.10.3) instead of silently yielding `false` from `instance of` and
+  `castable as`, or a run-time type error from `cast as`. This covers an unknown
+  name (`instance of nosuchtype`), an unprefixed name with no default
+  element/type namespace in scope (`castable as double`), the non-atomic
+  built-ins the specification's own note calls out (`xs:IDREFS`, `xs:NMTOKENS`,
+  `xs:ENTITIES`, `xs:anyType`, `xs:anySimpleType`, `xs:error`), and a name that
+  a schema set in the static context does not define as a simple type.
+  `xs:anyAtomicType` and `xs:NOTATION` are atomic types and remain accepted in
+  `instance of` and `treat as`; as the target of `cast as` or `castable as`
+  they are the static error `XPST0080` (§3.10.2, §3.10.3), which
+  `XPathError::error_code` reports for an error carried as an error QName —
+  `'a' castable as xs:NOTATION` was `true`, and `1 cast as xs:NOTATION` failed
+  at run time with `FORG0001`. A user-defined simple type of the schema set
+  passes the `XPST0051` check but is not yet supported as an `AtomicType`: as
+  in 0.2.0, `instance of` and `castable as` answer `false` for it, `treat as`
+  fails and `cast as` raises `XPST0051` when it is evaluated, and a list or
+  union type is not rejected at compile time.
+- The `TypeName` of an `element(N, T)` or `attribute(N, T)` test is now matched
+  instead of ignored — in `instance of` and `treat as`, and as the node test of
+  a path step, inside `document-node(…)` too — so
+  `/doc instance of element(*, xs:integer)` is no longer `true` for a document
+  that was never validated, and `/doc/element(*, xs:integer)` no longer selects
+  every child. §2.5.4.3 and §2.5.4.5 require
+  `derives-from(AT, TypeName)`, `AT` being the node's type annotation; an
+  untyped element's annotation is `xs:untyped` and an untyped attribute's is
+  `xs:untypedAtomic`, which derive from none of the ordinary schema types (but
+  do derive from `xs:anyType`, and the latter also from `xs:anySimpleType` and
+  `xs:anyAtomicType`). For an annotated node the comparison uses the schema
+  set's derivation relation, so a user-defined type name works as well.
+  `element(N, T)` now also requires the node's nilled property to be false,
+  which only `element(N, T?)` relaxes. A step applies the whole test before its
+  predicates, so `element(*, T)[1]` is the first child that matches it. A
+  `TypeName` that is not in the in-scope schema types — the built-in types of
+  the XML Schema namespace, `xs:untyped` included, and the named types of the
+  static context's schema set — is the static error `XPST0008` (§2.5.4.3,
+  §2.5.4.5); it used to be accepted and ignored, so without a schema set a type
+  name outside the XML Schema namespace now fails to compile.
+- In XPath 1.0 compatibility mode — `XPathContext::with_xpath10_compatibility`
+  (see *Added*), or `XPathMode::XPath10`, which implies it — the conversions
+  XPath 2.0 adds in that mode are applied. §3.1.5: if an
+  argument **is not of the expected type**, and that type is a single or optional
+  single item, the argument is replaced by its first item, an argument whose
+  expected type is `xs:string`/`xs:string?` by `fn:string` of it, and one whose
+  expected type is `xs:double`/`xs:double?` (the declared type of every `numeric`
+  parameter) by `fn:number` of it — so `round(concat('20','.7'))` is `21` instead
+  of a type error, while `compare((), '')` and `round(())`, whose argument
+  already is of the expected type, keep returning the empty sequence. The
+  condition is about the argument's *static* type, which §2.2.3.1 leaves
+  implementation-dependent without the Static Typing Feature: an argument that
+  evaluates to the empty sequence counts as being of an optional expected type
+  only when the argument expression is the literal `()`, the one expression
+  §2.3.4 allows the static type `empty-sequence()`, so a path expression that
+  selects no nodes is still converted and `round(doc/none)` is `NaN`. §3.4: an
+  arithmetic
+  operand is likewise reduced to its first item and converted with `fn:number`,
+  and an empty operand makes the whole expression `NaN` rather than the empty
+  sequence — so `1 + (6 to 10)` is `7` and `1 + ()` is `NaN`. The same first-item
+  rule applies to the operands of `to` (§3.3.1), whose expected type is
+  `xs:integer?`. The date, time and duration types are outside §3.4's conversion
+  list, so arithmetic over them keeps the XPath 2.0 operator mapping in
+  compatibility mode, and `idiv`, which XPath 1.0 does not have, keeps its
+  integer result. None of this changes anything when the flag is off and the
+  language mode is XPath 2.0. In `XPathMode::XPath10`, `1 + /doc/a` over two
+  `a` elements therefore adds the first one, where it raised `XPDY0050`.
+- `fn:matches`, `fn:replace` and `fn:tokenize` now reject regular-expression
+  syntax that XPath 2.0 does not define. The backing engine implements a later
+  dialect, which added the `(?…)` group forms and the `q` flag; an XPath 2.0
+  `(` always opens a capturing group and can never be followed by `?`, and the
+  only defined flags are `s`, `m`, `i` and `x`. `(?:a)` now raises `FORX0002`
+  and `q` raises `FORX0001`. An escaped `\(?` and a `?` inside a character
+  class, including a subtracted one such as `[a-z-[(?]]`, are unaffected, and
+  so are `xs:pattern` facets, which compile through a separate path. With the
+  `x` flag the check reads the pattern after whitespace has been removed, so
+  `\ (?` is the escaped `\(?` and is accepted, as F&O §7.6.1.1 requires.
+- `fn:tokenize` no longer drops zero-length tokens. Every gap between two
+  matches of the separator is a token, so a leading separator produces an empty
+  first token, a trailing separator an empty last token, and two adjacent
+  separators an empty token between them: `tokenize("a,,b", ",")` now returns
+  three tokens and `tokenize(",a,", ",")` returns `("", "a", "")`.
+- String literals are no longer re-decoded by the lexer. XPath 2.0 §3.1.1 makes
+  a literal's value the characters between the delimiters, a doubled delimiter
+  standing for one; XML un-escaping belongs to the host language and has already
+  happened by the time the expression text arrives. The lexer used to expand XML
+  entity and character references a second time and fold CR/CRLF to LF, so
+  `concat('a&b','!')` failed to compile, `string-length('&#13;')` was 1 instead
+  of 5, and a literal carriage return became a line feed.
+- A `DecimalLiteral` may now end with its period. XPath 2.0 §A.2.1 gives
+  `DecimalLiteral ::= ("." Digits) | (Digits "." [0-9]*)`, so `5.` is a valid
+  literal; it previously failed to lex.
+- A numeric literal whose exponent has no digits — `1e`, `5.0e`, `1e+` — is a
+  syntax error (`XPST0003`), as the `DoubleLiteral` production of XPath 2.0
+  §A.2.1 requires; it lexed as a double literal and evaluated to NaN.
+- The lexer's `NCName` predicates now implement the XML 1.0 §2.3
+  `NameStartChar` / `NameChar` productions (minus `":"`) instead of Rust's
+  Unicode `Alphabetic` / `Alphanumeric` properties, which admitted characters
+  such as U+00B5 MICRO SIGN that the productions exclude.
+- Only the XML Schema lexical forms convert to `xs:double` and `xs:float`. A
+  string or `xs:untypedAtomic` value was converted with Rust's own float
+  parser — in `cast as`, `castable as` and the constructor functions, in
+  arithmetic and comparisons, in `fn:number`, `fn:sum`, `fn:avg`, `fn:min` and
+  `fn:max` — which also accepts `inf`, `infinity` and `nan` in any case and
+  trims Unicode whitespace. Those spellings are now not numbers (XPath 2.0
+  Appendix I.1): `xs:double('inf')` raises `FORG0001`, as does an
+  `xs:untypedAtomic` `inf` in arithmetic, a comparison or an aggregate,
+  `'inf' castable as xs:double` is `false`, and `number('Infinity')` is `NaN`;
+  and only XML whitespace around a number is ignored. `INF`, `+INF`, `-INF`
+  and `NaN` are unchanged. `xpath::atomize::to_number`, the public helper
+  behind `fn:number`, follows the same rule.
+- SequenceType matching now follows the whole built-in atomic type hierarchy
+  instead of a hand-written table covering only the string and numeric
+  branches. Two results change: `xs:untypedAtomic` is no longer an `xs:string`
+  (it derives from `xs:anyAtomicType`), and `xs:dayTimeDuration` and
+  `xs:yearMonthDuration` now are `xs:duration`s. The other branches —
+  `xs:dateTimeStamp` under `xs:dateTime`, the `xs:ID`/`xs:IDREF`/`xs:ENTITY`
+  leaves of the string branch — are now modelled as well.
+- `fn:min` and `fn:max` accept every type that has an ordering, not only the
+  numeric and string ones: `xs:date`, `xs:time`, `xs:dateTime`, `xs:boolean`
+  and the two ordered duration types used to raise `FORG0006`. A sequence that
+  mixes primitive types still raises `FORG0006`, which it did not always do
+  before. NaN is returned as a value of the numbers' least common type, so
+  `max((xs:float('NaN'), 1))` is an `xs:float`; it was always an `xs:double`.
+- `fn:index-of` and `fn:distinct-values` compare with the `eq` operator, as
+  F&O §15.1.5 and §15.1.6 require. They compared the type as well as the
+  value, so an `xs:token`, an `xs:ID` or an `xs:NMTOKEN` never equalled the
+  `xs:string` it spells: `index-of(xs:token('a'), 'a')` was the empty
+  sequence, and so was F&O's own example, `index-of(@a, "blue")` over an
+  `xs:NMTOKENS` attribute `red green blue`. Dates and times now also compare
+  on the timeline, durations by value across their subtypes (`P12M` and `P1Y`
+  are one distinct value) and QNames by expanded name; a pair `eq` cannot
+  compare is still distinct, and `fn:distinct-values` still treats NaN as
+  equal to NaN.
+- `fn:sum` no longer widens integers: it accumulates with `op:numeric-add`, so
+  `sum((1, 2, 3))` is an `xs:integer` rather than an `xs:decimal`. `fn:avg`
+  keeps returning an `xs:decimal` for an integer input, because dividing two
+  integers yields one.
+- `fn:sum` and `fn:avg` raise `FORG0006` for a mixture of individually
+  summable types — a number and a duration, or an `xs:yearMonthDuration` and
+  an `xs:dayTimeDuration` — as F&O §15.4.5 and §15.4.2 require. Such a sum
+  failed with an error that carried no code.
+- `fn:sum`'s `$zero` argument is honoured when it is itself the empty sequence:
+  `sum((), ())` is now the empty sequence instead of the integer 0. Omitting
+  the argument still gives 0.
+- `fn:round-half-to-even` decides a tie on the exact value of its argument
+  rather than on a scaled binary product, and a zero result keeps the sign of
+  the argument. `round-half-to-even(250.0250e0, 2)` is now `250.03`,
+  `round-half-to-even(xs:float(150.0150e0), 2)` is `150.01`, and
+  `round-half-to-even(-3.0e0, -2)` is `-0`. A large precision no longer gives
+  NaN: `round-half-to-even(1234.5678e0, 400)` and
+  `round-half-to-even(5e-324, 400)` return their argument.
+- `fn:subsequence` now evaluates its two position comparisons in `xs:double`
+  arithmetic as the specification defines them, so infinite and NaN arguments
+  behave: `subsequence(1 to 20, -INF, INF)` is the empty sequence, because the
+  two bounds sum to NaN.
+- `idiv` on `xs:float` and `xs:double` operands raises `FOAR0002`, not
+  `FOAR0001`, when an operand is NaN or the dividend is infinite (F&O
+  §6.2.5); `FOAR0001` remains the code for a zero divisor. A quotient beyond
+  the 64-bit range is now exact — `1e20 idiv 1` is `100000000000000000000` —
+  where it saturated at `9223372036854775807`.
+- `fn:nilled` reports the post-schema-validation property instead of looking
+  for an `xsi:nil` attribute, so an element that was never validated is not
+  nilled.
+- `fn:resolve-QName` reports the specified error codes: `FOCA0002` for a value
+  that is not a lexical QName (it raised `FORG0001`, the code for a failed
+  `cast as xs:QName`) and `FONS0004` for a prefix the element does not bind (it
+  raised the static error `XPST0081`).
+- `fn:base-uri` follows the XDM accessor rules for the remaining node kinds: a
+  namespace node has no base URI, and an attribute node has its parent
+  element's or none at all when it has no parent. A namespace node used to
+  report its owner element's base URI, and a parentless attribute the
+  document's.
+- `fn:resolve-uri` validates both arguments and reports `FORG0002` for one that
+  is not a valid URI reference — including a base URI that is not absolute —
+  keeping `FORG0009` for a resolution that fails. The validation also rejects
+  more than one `#` and the characters no URI production allows, which it let
+  through before. A base URI that has a fragment identifier or is not
+  hierarchic (`mailto:…`, `urn:…`) is `FORG0002` as well, and so is a
+  zero-length base when `$relative` is relative, which raised `FORG0009`
+  (F&O §8.1).
+- `RoXmlNavigator::name` returns the qualified name as the document writes it,
+  for elements and for attributes. It returned the local name, dropping the
+  prefix, which also affected `fn:name` and serialization through that
+  navigator. The name is read back out of the document's source text, and the
+  scan ends at XML's whitespace — the four characters of XML 1.0 §2.3 production
+  `S` — and not at Unicode's, so a name containing U+1680 OGHAM SPACE MARK or
+  another character that is a legal XML `NameChar` in `[#x37F-#x1FFF]` is
+  returned whole.
+- `fn:deep-equal` compares namespace nodes. A namespace node has no children,
+  so the generic child-sequence comparison reported every pair of them as
+  equal; two namespace nodes are now deep-equal only when their names — the
+  prefix, absent for a default-namespace binding — and their string values, the
+  bound namespace URI, both match.
+- `schema-element(N)` and `schema-attribute(N)` used as **step** node tests are
+  the declaration-aware tests of XPath 2.0 §2.5.4.4 and §2.5.4.6. As a step
+  they matched every node on the axis. Both tests, in every spelling — a step,
+  `instance of`, `treat as`, a function signature — are now decided by one
+  implementation, which also gained the substitution-group clause and the
+  nilled clause and accepts a complex-typed declaration. A name that is not
+  declared matches nothing — §2.5.4.4 and §2.5.4.6 make it the static error
+  `XPST0008`, which this release does not raise — and without a schema set in
+  the static context the tests remain name-only, as before.
+- Atomizing a namespace node yields `xs:string`, not `xs:untypedAtomic` — the
+  rule that already applied to comments and processing instructions.
+- `fn:namespace-uri-for-prefix` returns the empty sequence, not
+  `xs:anyURI("")`, when the prefix has no binding — including the empty prefix
+  on an element with no default namespace.
+- A namespace prefix with no binding inside a kind test — `element(p:x)`,
+  `attribute(p:a)`, `element(*, p:T)`, `schema-element(p:x)`, the same inside
+  `document-node(...)` or a SequenceType — is the static error `XPST0081`. It
+  silently resolved to no namespace.
+- Under XSD 1.1 assertion scope the data model instance is cut at the asserted
+  element, as §3.13.4.1 clause 1.3 constructs it: `parent::`, `ancestor::`,
+  `following::`, `following-sibling::` and `preceding-sibling::` no longer
+  reach outside it (`preceding::` and the downward axes never did). As the
+  specification's note says, such a reference is not an error, it selects
+  nothing. `/` and `fn:root()` are unchanged: they still answer a document
+  node whose children are hidden, so `//x` inside an assertion is empty, which
+  is what the W3C test suite expects.
+- Inside an XSD 1.1 assertion `fn:id` finds the elements inside the asserted
+  element, and only those, as §3.13.4.1 clause 1.3 constructs the data model
+  instance. It found nothing at all in an assertion, because the buffer the
+  validator builds to evaluate assertions indexed no ids: now
+  `exists(id('y'))` holds on an element with a descendant `xml:id="y"`, while
+  an element outside the asserted one — a sibling, say — is never found, even
+  when it claims the value first.
+- `fn:deep-equal` no longer looks at comment and processing-instruction
+  **children**. F&O §15.3.1 compares a document or element node's
+  `$i/(*|text())`, a sequence that holds neither kind, so
+  `deep-equal(<a>x<!--c--></a>, <a>x</a>)` is now true where it was false.
+  Such a child still *splits* the text around it and text nodes are never
+  merged, so `<a>x<!--c-->y</a>` has two text children and remains different
+  from `<a>xy</a>`; and a comment or PI that is itself an item of the two
+  compared sequences is still compared, by string value and, for a PI, by
+  target. `TreeComparer` is unchanged: its `deep_equal` and `deep_equal_iter`
+  keep comparing every child, which is what a serialization round-trip check
+  needs.
+- `fn:deep-equal` compares two elements according to their **content**, as
+  F&O §15.3.1 clauses (2) and (4) prescribe, instead of always comparing their
+  children. Two elements annotated as having simple content — a simple type,
+  or a complex type whose content is text-only — are compared by their typed
+  values, so a validated `<a>1</a>` and `<a>01</a>` of type `xs:integer` are
+  now deep-equal. With element-only content only the child elements are
+  compared, so whitespace between them no longer counts; with mixed content
+  the `(*|text())` sequences are compared, as before. An element annotated as
+  having simple content is never deep-equal to one with complex content.
+  Without a schema set in the static context the content kind of a complex
+  type is not read: the element's typed value decides between simple and
+  complex content, complex content is compared as mixed, and a nilled element
+  of a complex type is compared as having the other element's content kind.
+- `fn:deep-equal` compares two attributes' typed values with `eq` semantics,
+  the same rule it applies to a free-standing atomic item, instead of plain
+  value equality. The two answers could differ for schema-validated
+  attributes: an `xs:integer` `1` and an `xs:decimal` `1.0` were reported
+  different as attributes and equal as items. Untyped attributes are
+  `xs:untypedAtomic` and compare as strings either way, so nothing changes for
+  an unvalidated document.
+- `fn:tokenize` reports an invalid `$pattern` (FORX0002), invalid `$flags`
+  (FORX0001) and a `$pattern` that matches the zero-length string (FORX0003)
+  when `$input` is the empty sequence or a zero-length string. It returned the
+  empty sequence for such an input before looking at the pattern at all, so
+  `tokenize("", "[")` and `tokenize((), "a*")` silently succeeded. F&O §7.6.4
+  states the three errors with no exemption for any input, and states the
+  empty-sequence result separately; that result is unchanged for a pattern
+  that raises nothing, so `tokenize("", "\s+")` is still the empty sequence.
+- `fn:replace` reports a malformed `$replacement` (FORX0004) even when nothing
+  is replaced — when `$input` is empty, or when `$pattern` matches nowhere in
+  it. The replacement string was only validated while the matches were walked,
+  so `replace("", "a", "$")` and `replace("abc", "z", "$")` returned a string
+  instead of raising. The two rules are unchanged: a `\` must be followed by a
+  `\` or a `$`, and a `$` that is not part of such a pair must be followed by
+  a digit.
+- `fn:id` found an element by its `xml:id` only in a `DocumentKind::Full`
+  document read from text (`from_reader` or `build_typed_document`), and only
+  when the attribute value had no surrounding whitespace. The id index is now
+  filled from `BufferDocumentBuilder::attribute` for an attribute of an
+  element, the one place an attribute node is created, so a document built
+  through the push API, a `Fragment` buffer and a copied subtree carry their
+  ids too; and the index key is the value with XML whitespace stripped and
+  collapsed, so `xml:id="d "` answers to `id(' d')`. Only the key is
+  normalized — the attribute keeps its own value.
+  `BufferDocument::get_element_by_id` reads the same index: it normalizes its
+  argument the same way, never answers for a value that is not an NCName
+  (`xml:id="a b"` and `xml:id="1x"` used to be found by their literal value),
+  and finds `xs:ID`-typed attributes too (see *Added*).
+- `fn:id` tokenized its argument on Unicode whitespace and looked up
+  every token. It now follows F&O §15.5.2: the candidate IDREFs are
+  `tokenize(normalize-space($s), ' ')` — XML whitespace only — and a
+  token that is not a lexical NCName is ignored instead of looked up.
+  An `xml:id` whose value is not an NCName is never selected.
+- `fn:id` returned an empty sequence where the specification requires an
+  error: it now raises `FODC0001` when the node it is given is in a tree
+  whose root is not a document node. In the test of an XSD 1.1 type
+  alternative, whose data model instance is rooted at the element itself
+  (Structures §3.12.4), `fn:id` therefore makes the test false, as any
+  dynamic error there does; it used to see the empty sequence.
+- A `Fragment` buffer — whose document node holds parentless trees — now
+  indexes the ids of each of its trees, and
+  `BufferDocumentBuilder::register_xml_id`, which did nothing at all for a
+  `Fragment` buffer, files them there too. When two elements of one tree share
+  an id, the first in document order is the one selected, as F&O §15.5.2
+  requires, and a tree built through the push API is not refused for it.
+  Reading a `Full` document from text — with `from_reader` or
+  `build_typed_document` — still reports `BufferDocumentError::DuplicateId`,
+  now comparing the normalized values, so `xml:id="a"` and `xml:id=" a"`
+  collide where they used to be accepted, and ignoring values that are not
+  NCNames, which are never ids, so two `xml:id="1x"` are no longer reported.
+  `register_xml_id` normalizes its value the same way, refuses one that
+  another element of the same tree already has (in a `Full` document, any
+  other element), accepts a repeat for the same element, which used to be
+  `DuplicateId`, ignores a node that is not an element, and panics on a node
+  reference that is not a node of the document being built, where it used to
+  accept any reference unchecked.
+- `XPathValue::as_slice` returns a one-element slice for a single item. It
+  returned an empty slice for the `Item` variant, so a caller that borrowed a
+  one-item value as a slice saw no items while `len()` said 1. The slice now
+  always has `len()` elements, in sequence order, and is borrowed without
+  cloning; the signature is unchanged, and a caller that matched the `Item`
+  variant to work around it keeps working.
+- `BufferDocumentBuilder::copy_attribute`, replacing an attribute of the
+  same expanded name with one that carries no type annotation — a copy with
+  `Annotations::Strip`, or of an untyped attribute — left the earlier
+  attribute's annotation on the node, so the new value was reported with the
+  old type. The later attribute now wins with its annotation or the lack of
+  one, and `BufferDocument::has_type_annotations` stays exact.
+- Atomizing a node whose type is a list type now yields one atomic value per
+  list member, each typed with the list's item type (XDM §3.3.1.2, XPath 2.0
+  §2.5.2). It yielded the whole list as a single value, so `data(@refs)` of an
+  `xs:IDREFS` attribute holding `a b` had one item, and every operator and
+  function saw that one value. This changes answers that a schema-aware host
+  can observe: `@refs = 'b'` is now true where it was false (or raised
+  `XPTY0004` for a built-in list type such as `xs:NMTOKENS` or `xs:IDREFS`),
+  and `@refs = 'a b'` is now false where it was true; `@refs eq 'b'`,
+  arithmetic on a list of several members and `xs:string(@refs)` now raise
+  `XPTY0004` instead of answering (or failing with an error that had no code);
+  `sum()`, `avg()`, `min()` and `max()` of a list of numbers add and compare
+  the members instead of returning the list's text; `count(data(@refs))`,
+  `distinct-values()`, `index-of()`, `string-join()` and `deep-equal()` see
+  the members; a list with no members atomizes to the empty sequence. XPath
+  1.0 compatibility mode applies its conversions to each member. The string
+  value of such a node, and `fn:string`, are unchanged: still the whole text.
+  `atomize::atomize_node` still returns the typed value as it is stored, one
+  value of kind `XmlValueKind::List`. For a list whose item type is a union,
+  the member type the validator actually chose is not recorded per member:
+  each member is typed with the list's recorded item type, or `xs:string`
+  when it holds a lexical form that type cannot hold.
+  `compose::Value::atomics` likewise yields one value per member, and
+  `Value::number` and `Value::key` raise `XPTY0004` for a single node whose
+  list-typed value has several members and treat one with no members as the
+  empty sequence (`NaN`, `None`); they used to see the whole list as one
+  value.
+- A nilled element, whose typed value is the empty sequence, now makes a value
+  comparison, an arithmetic expression or a unary `+`/`-` return the empty
+  sequence, as XPath 2.0 §3.4 and §3.5.1 require, instead of raising
+  `XPTY0004`; `castable as T?` of it is true and `castable as T` false.
+- The arguments of the built-in functions are now atomized as the function
+  conversion rules require (XPath 2.0 §3.1.5): a node contributes its typed
+  value, not its string value. A schema-aware host sees the difference:
+  `fn:number(@flag)` of an `xs:boolean` attribute `true` is now `1` instead of
+  `NaN`, `concat(@n, '')` of an `xs:integer` attribute ` 5 ` is `5`, a string
+  argument whose typed value has several members raises `XPTY0004`, an empty
+  typed value is the empty sequence (so `compare(@empty, 'a')` is the empty
+  sequence), and an element with element-only content passed where a string or
+  number is expected raises `FOTY0012`, because it has no typed value.
+  `fn:string`, the zero-argument string functions (`string-length()`,
+  `normalize-space()`), and the `fn:string(V)` step of XPath 1.0
+  compatibility mode keep reading the string value. Untyped nodes are
+  unaffected: their typed value is their string value.
+- An element whose complex type has mixed content — `xs:anyType` included — now
+  has its string value as an `xs:untypedAtomic` typed value, and one whose
+  complex type has empty content has the empty sequence, as XDM §6.2.4
+  requires. `BufferDocNavigator::typed_value` reported both as having no typed
+  value (`TypedValue::Absent`), so atomizing such an element — in a
+  comparison, in `fn:data`, in an XSD 1.1 assertion — raised `FOTY0012`. It now
+  returns `TypedValue::Untyped` for mixed content and an empty list value for
+  empty content; element-only content is still `Absent`.
+- `fn:deep-equal` compares two typed values item by item, as F&O §15.3.1
+  requires of the typed values of two simple-content elements or two
+  attributes: same length, and each pair equal under `eq`, with `NaN` equal to
+  `NaN`. A list-typed value was compared as one value, so two lists whose
+  members include `NaN`, or an `xs:IDREFS` value and a list-of-`xs:IDREF`
+  value with the same members, were reported different. `TreeComparer` is
+  unchanged.
+
+### Performance
+
+- The general comparison operators `=` and `!=` no longer walk the whole
+  Cartesian product of their operands. XPath 2.0 §3.5.2 makes `A = B` an
+  existential test over every pair of atomized items, which the evaluator
+  answered with a nested loop — `O(|A| · |B|)`, and unusable once both
+  operands hold more than a few thousand items. The comparison now walks a
+  bounded prefix of the product, so that a small comparison or an early match
+  still costs exactly what it did, and then decides the rest with a hash index
+  over the comparison classes of §3.5.2 in `O(|A| + |B|)`: numeric (keyed at
+  the type the pair promotes to), string-like (including `xs:untypedAtomic`
+  compared as a string, and `xs:untypedAtomic` cast to `xs:double` against a
+  numeric), boolean, `xs:dateTime`/`xs:date`/`xs:time` keyed at the instant the
+  comparison normalizes them to, the durations keyed at their (months, seconds)
+  pair, `xs:QName`, and the types whose equality is structural. Every candidate
+  the index finds is confirmed with the ordinary value comparison, and any
+  input the index does not model — a conversion that fails, a union-typed
+  value, `xs:untypedAtomic` against a type that is neither numeric nor
+  string-like — falls back to the original loop, so results and errors,
+  including which error a comparison raises and when, are unchanged. Two
+  disjoint sequences of 100,000 items now compare in ~25 ms; before, 10,000
+  items already took ~16 s.
+- A `=` or `!=` comparison that is evaluated over and over — the predicate of
+  `$big[. = $c]`, the body of a `for` or a quantified expression — now reuses
+  the index of the operand that does not change during the evaluation, instead
+  of rebuilding it every time. An operand counts as unchanging only if a
+  conservative static analysis says so: it must read no part of the focus, call
+  no function, and reference no variable bound by a `for`, `some` or `every`;
+  on top of that, every reuse re-checks that the variables it was built from
+  have not been rebound. The index lives in the dynamic context of the one
+  evaluation run and is dropped with it, nothing is built before the second
+  evaluation of the same comparison, and the index only answers a comparison
+  when it can prove both the answer and the absence of an error for that pair
+  of operands, so results and errors are unchanged. An index is keyed by a
+  serial number of the expression's syntax tree, not by its address, so a host
+  function that compiles and evaluates expressions of its own on the caller's
+  `DynamicContext` is never answered from another expression's index, and
+  replacing `DynamicContext::variables` with another store is detected as a
+  rebinding. A host function registered
+  through `FunctionSet` receives `&mut DynamicContext` and may rebind a
+  variable while the other operand of the same comparison is being evaluated;
+  such a write is detected, and the comparison then answers exactly what it
+  would have answered without an index, with both operands evaluated in source
+  order. Filtering 1,000,000 items
+  against a 100,000-item sequence goes from days to ~0.4 s; the same filter
+  against a one-item sequence is about twice as fast as before.
+- `fn:matches`, `fn:replace` and `fn:tokenize` compile each regular expression
+  once per evaluation run. They recompiled their `$pattern` argument on every
+  call, so a constant pattern inside a predicate —
+  `$items[matches(., '\p{Ll}')]` — paid for a full compile, including the
+  expansion of any Unicode category it names, once per item. The compiled
+  programs of one run are kept in its dynamic context, keyed by
+  `(pattern, flags)`, bounded at 32 entries with least-recently-used eviction,
+  and dropped when the run ends. A pattern that fails to compile is remembered
+  too, and raises the same error every time. Answers, error codes and error
+  messages are unchanged. On a 100,000-item filter `matches(., '\p{Ll}')` goes
+  from 6.6 s to 67 ms; `replace()` in a loop is 23× faster and `tokenize()`
+  39×; a single call, and a pattern computed afresh for every item, cost what
+  they did.
 
 ## [0.2.0] - 2026-09-13
 
@@ -764,7 +1647,8 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
-[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/semyonc/xsd-schema/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/semyonc/xsd-schema/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/semyonc/xsd-schema/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/semyonc/xsd-schema/compare/v0.1.3...v0.1.4

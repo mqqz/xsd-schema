@@ -24,23 +24,250 @@ use crate::types::XmlTypeCode;
 ///
 /// Interprets [`TypedValue`] with proper error handling:
 /// - `Value(v)` → `Ok(Some(v))`
-/// - `Untyped` → `Ok(Some(untypedAtomic(string-value)))` (or `xs:string` for comment/PI)
+/// - `Untyped` → `Ok(Some(untypedAtomic(string-value)))` (or `xs:string` for a
+///   comment, processing instruction or namespace node — XPath 2.0 §I.2)
 /// - `Nilled` → `Ok(None)` (empty sequence)
 /// - `Absent` → `Err(FOTY0012)`
+///
+/// The typed value of a node whose type is a list type comes back as it is
+/// stored: one value of kind [`XmlValueKind::List`] holding every member. The
+/// XPath operators and functions — `fn:data`, the comparisons, arithmetic, the
+/// function conversion rules — see it as the sequence of its members instead,
+/// one atomic value per member, each of the list's item type (XDM 1.0
+/// §3.3.1.2; XPath 2.0 §2.5.2: "The typed value of a node is never treated as
+/// an instance of a named list type").
 pub fn atomize_node<N: DomNavigator>(nav: &N) -> Result<Option<XmlValue>, XPathError> {
     match nav.typed_value() {
         TypedValue::Value(v) => Ok(Some(v)),
         TypedValue::Untyped => {
             let v = match nav.node_type() {
-                DomNodeType::Comment | DomNodeType::ProcessingInstruction => {
-                    XmlValue::string(nav.value())
-                }
+                // XPath 2.0 §I.2 (Incompatibilities when Compatibility Mode is
+                // false): "The typed value of a comment node, processing
+                // instruction node, or namespace node under XPath 2.0 is of
+                // type xs:string, not xs:untypedAtomic." None of these three
+                // kinds can carry a type annotation, so `Untyped` here means
+                // "has no annotation", not "annotated xs:untyped".
+                DomNodeType::Comment
+                | DomNodeType::ProcessingInstruction
+                | DomNodeType::Namespace => XmlValue::string(nav.value()),
                 _ => XmlValue::untyped(nav.value()),
             };
             Ok(Some(v))
         }
         TypedValue::Nilled => Ok(None),
         TypedValue::Absent => Err(XPathError::no_typed_value()),
+    }
+}
+
+// ============================================================================
+// The sequence of atomic values a value stands for
+// ============================================================================
+
+/// The members of a packed list value, one atomic value each, in order.
+///
+/// A typed value of kind [`XmlValueKind::List`] is how the validator stores
+/// the typed value of a node whose type is a list type; XPath sees it as the
+/// sequence of its members (XDM 1.0 §3.3.1.2, XPath 2.0 §2.5.2). Each member
+/// is typed with the list's item type (see `member_type` for the one
+/// exception).
+#[derive(Debug)]
+pub(crate) struct ListMembers {
+    item_type: XmlTypeCode,
+    items: std::vec::IntoIter<XmlAtomicValue>,
+}
+
+impl Iterator for ListMembers {
+    type Item = XmlValue;
+
+    #[inline]
+    fn next(&mut self) -> Option<XmlValue> {
+        let atom = self.items.next()?;
+        Some(XmlValue::new(
+            member_type(self.item_type, &atom),
+            XmlValueKind::Atomic(atom),
+        ))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.items.size_hint()
+    }
+}
+
+impl ExactSizeIterator for ListMembers {}
+
+impl ListMembers {
+    /// At most one member: `None` for an empty list, the member for one, and
+    /// the type error `XPTY0004` for more — the rule of every operand and
+    /// parameter that takes an optional single atomic value (XPath 2.0 §3.1.5,
+    /// §3.4, §3.5.1).
+    pub(crate) fn at_most_one(mut self) -> Result<Option<XmlValue>, XPathError> {
+        let count = self.len();
+        if count > 1 {
+            return Err(XPathError::type_mismatch(
+                "a single atomic value",
+                format!("a typed value of {count} list members"),
+            ));
+        }
+        Ok(self.next())
+    }
+}
+
+/// The type of one list member: the list's item type, unless the member's
+/// stored value cannot be a value of that type.
+///
+/// That happens for a list whose item type is a union. The validator keeps
+/// such a member as its lexical form (an `xs:string` atom), and the single
+/// `item_type` a packed list carries records the member type the *last*
+/// member was validated against — `xs:integer` for `x 1` under a union of
+/// `xs:integer` and `xs:string`, say. Handing out a value annotated
+/// `xs:integer` that holds a string would make every operation on it fail
+/// without an error code, so such a member is typed `xs:string`, which is what
+/// it holds. (The exact type of each member — the union member type actually
+/// chosen, XDM §3.3.1.2 — needs a representation that records it per member.)
+#[inline]
+fn member_type(item_type: XmlTypeCode, atom: &XmlAtomicValue) -> XmlTypeCode {
+    match atom {
+        XmlAtomicValue::String(_)
+            if !item_type.is_string_derived() && item_type != XmlTypeCode::UntypedAtomic =>
+        {
+            XmlTypeCode::String
+        }
+        _ => item_type,
+    }
+}
+
+/// Split a packed list value into its members.
+///
+/// This is the single place where XPath atomization unpacks a list, so every
+/// path that atomizes — `fn:data`, the general and value comparisons and their
+/// hash index, arithmetic, the function conversion rules, `fn:deep-equal` —
+/// sees the same members. `Ok` for a value of kind [`XmlValueKind::List`], and
+/// for a union value whose chosen member type is a list type (a `List` inside
+/// [`XmlValueKind::Union`]); every other value is handed back unchanged in
+/// `Err`, after a single discriminant test for an atomic value.
+#[inline]
+pub(crate) fn unpack_list(value: XmlValue) -> Result<ListMembers, XmlValue> {
+    match value {
+        XmlValue {
+            value: XmlValueKind::List { item_type, items },
+            ..
+        } => Ok(ListMembers {
+            item_type,
+            items: items.into_iter(),
+        }),
+        XmlValue {
+            value: XmlValueKind::Union(inner),
+            ..
+        } if holds_list(&inner) => unpack_list(*inner),
+        other => Err(other),
+    }
+}
+
+/// Whether `value` is a packed list, possibly inside unions — i.e. whether
+/// [`unpack_list`] would take it apart. One discriminant test for an atomic
+/// value, so a hot loop can keep its single-value path exactly as it was.
+#[inline]
+pub(crate) fn is_packed_list(value: &XmlValue) -> bool {
+    match &value.value {
+        XmlValueKind::Atomic(_) | XmlValueKind::UntypedAtomic(_) => false,
+        _ => holds_list(value),
+    }
+}
+
+/// Whether `value` is a packed list, possibly inside unions.
+fn holds_list(value: &XmlValue) -> bool {
+    match &value.value {
+        XmlValueKind::List { .. } => true,
+        XmlValueKind::Union(inner) => holds_list(inner),
+        _ => false,
+    }
+}
+
+/// The atomic values one item atomizes to (XPath 2.0 §2.4.2): none (a nilled
+/// element, an empty list), one, or the members of a list.
+#[derive(Debug)]
+pub(crate) enum Atoms {
+    /// No value, or exactly one value that is not a list.
+    One(Option<XmlValue>),
+    /// The members of a list.
+    Members(ListMembers),
+}
+
+impl Atoms {
+    /// The atomic values `value` stands for: its members if it is a packed
+    /// list (see [`unpack_list`]), otherwise `value` itself.
+    #[inline]
+    pub(crate) fn of(value: XmlValue) -> Self {
+        match unpack_list(value) {
+            Ok(members) => Atoms::Members(members),
+            Err(value) => Atoms::One(Some(value)),
+        }
+    }
+}
+
+impl Iterator for Atoms {
+    type Item = XmlValue;
+
+    #[inline]
+    fn next(&mut self) -> Option<XmlValue> {
+        match self {
+            Atoms::One(value) => value.take(),
+            Atoms::Members(members) => members.next(),
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Atoms::One(value) => {
+                let n = usize::from(value.is_some());
+                (n, Some(n))
+            }
+            Atoms::Members(members) => members.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for Atoms {}
+
+/// Atomize a node into the atomic values of its typed value: [`atomize_node`]
+/// followed by [`Atoms::of`], so a list-typed node yields its members and a
+/// nilled element none.
+#[inline]
+pub(crate) fn node_atoms<N: DomNavigator>(nav: &N) -> Result<Atoms, XPathError> {
+    Ok(match atomize_node(nav)? {
+        Some(value) => Atoms::of(value),
+        None => Atoms::One(None),
+    })
+}
+
+/// The single atomic value `value` stands for: `value` itself if it is not a
+/// packed list, otherwise its only member — `None` for an empty list, and
+/// `XPTY0004` for more than one member (see [`ListMembers::at_most_one`]).
+#[inline]
+pub(crate) fn single_atom(value: XmlValue) -> Result<Option<XmlValue>, XPathError> {
+    if !is_packed_list(&value) {
+        return Ok(Some(value));
+    }
+    match unpack_list(value) {
+        Ok(members) => members.at_most_one(),
+        Err(value) => Ok(Some(value)),
+    }
+}
+
+/// Append the atomic values `value` stands for to `out`: its members if it is
+/// a packed list (see [`unpack_list`]), otherwise `value` itself, pushed
+/// directly.
+#[inline]
+pub(crate) fn push_atoms(value: XmlValue, out: &mut Vec<XmlValue>) {
+    if !is_packed_list(&value) {
+        out.push(value);
+        return;
+    }
+    match unpack_list(value) {
+        Ok(members) => out.extend(members),
+        Err(value) => out.push(value),
     }
 }
 
@@ -173,7 +400,9 @@ pub fn string_value_opt(value: Option<&XmlValue>) -> String {
 pub fn to_number(value: &XmlValue) -> f64 {
     match &value.value {
         XmlValueKind::Atomic(atom) => atomic_to_number(atom),
-        XmlValueKind::UntypedAtomic(s) => s.trim().parse().unwrap_or(f64::NAN),
+        XmlValueKind::UntypedAtomic(s) => {
+            crate::xpath::cast::parse_xsd_double(s).unwrap_or(f64::NAN)
+        }
         XmlValueKind::Union(inner) => to_number(inner),
         XmlValueKind::List { .. } => f64::NAN,
     }
@@ -193,7 +422,7 @@ fn atomic_to_number(atom: &XmlAtomicValue) -> f64 {
                 0.0
             }
         }
-        XmlAtomicValue::String(s) => s.trim().parse().unwrap_or(f64::NAN),
+        XmlAtomicValue::String(s) => crate::xpath::cast::parse_xsd_double(s).unwrap_or(f64::NAN),
         _ => f64::NAN,
     }
 }
@@ -255,6 +484,19 @@ pub fn unwrap_union(value: &XmlValue) -> &XmlValue {
     match &value.value {
         XmlValueKind::Union(inner) => unwrap_union(inner),
         _ => value,
+    }
+}
+
+/// [`unwrap_union`] by value: the member value of a union value, moved out
+/// rather than cloned; any other value is returned as it is.
+#[inline]
+pub(crate) fn unwrap_union_owned(value: XmlValue) -> XmlValue {
+    match value {
+        XmlValue {
+            value: XmlValueKind::Union(inner),
+            ..
+        } => unwrap_union_owned(*inner),
+        other => other,
     }
 }
 
@@ -424,6 +666,140 @@ mod tests {
             XmlValueKind::UntypedAtomic("element content".to_string()),
         );
         assert!(is_node(&node_value));
+    }
+
+    // --- The members of a packed list value ---
+
+    fn id_list(members: &[&str]) -> XmlValue {
+        XmlValue::new(
+            XmlTypeCode::Id,
+            XmlValueKind::List {
+                item_type: XmlTypeCode::Id,
+                items: members
+                    .iter()
+                    .map(|m| XmlAtomicValue::String(m.to_string()))
+                    .collect(),
+            },
+        )
+    }
+
+    fn describe(atoms: Atoms) -> Vec<(XmlTypeCode, String)> {
+        atoms.map(|v| (v.type_code, v.to_string_value())).collect()
+    }
+
+    #[test]
+    fn a_packed_list_unpacks_into_members_of_the_item_type() {
+        let members = unpack_list(id_list(&["a", "b"])).expect("a list");
+        assert_eq!(members.len(), 2);
+        let members: Vec<XmlValue> = members.collect();
+        assert_eq!(
+            members[0],
+            XmlValue::new(
+                XmlTypeCode::Id,
+                XmlValueKind::Atomic(XmlAtomicValue::String("a".into()))
+            )
+        );
+        assert_eq!(members[1].to_string_value(), "b");
+
+        // A built-in list type carries its own list code; the members take the
+        // item type.
+        let nmtokens = XmlValue::new(
+            XmlTypeCode::NmTokens,
+            XmlValueKind::List {
+                item_type: XmlTypeCode::NmToken,
+                items: vec![XmlAtomicValue::String("p".into())],
+            },
+        );
+        assert_eq!(
+            describe(Atoms::of(nmtokens)),
+            [(XmlTypeCode::NmToken, "p".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_union_whose_member_is_a_list_unpacks_too() {
+        let union = XmlValue::new(
+            XmlTypeCode::Id,
+            XmlValueKind::Union(Box::new(id_list(&["x", "y"]))),
+        );
+        assert_eq!(
+            describe(Atoms::of(union)),
+            [
+                (XmlTypeCode::Id, "x".to_string()),
+                (XmlTypeCode::Id, "y".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn any_other_value_is_handed_back_unchanged() {
+        let atomic = XmlValue::integer(BigInt::from(7));
+        assert_eq!(unpack_list(atomic.clone()).expect_err("not a list"), atomic);
+        let untyped = XmlValue::untyped("a b");
+        assert_eq!(
+            unpack_list(untyped.clone()).expect_err("not a list"),
+            untyped
+        );
+        let union = XmlValue::new(
+            XmlTypeCode::String,
+            XmlValueKind::Union(Box::new(XmlValue::string("s"))),
+        );
+        assert_eq!(unpack_list(union.clone()).expect_err("not a list"), union);
+        assert_eq!(Atoms::of(atomic.clone()).collect::<Vec<_>>(), [atomic]);
+    }
+
+    #[test]
+    fn at_most_one_member() {
+        assert_eq!(single_atom(id_list(&[])).unwrap(), None);
+        assert_eq!(
+            single_atom(id_list(&["c"]))
+                .unwrap()
+                .map(|v| (v.type_code, v.to_string_value())),
+            Some((XmlTypeCode::Id, "c".to_string()))
+        );
+        assert!(matches!(
+            single_atom(id_list(&["a", "b"])),
+            Err(XPathError::XPTY0004 { .. })
+        ));
+        let one = XmlValue::string("s");
+        assert_eq!(single_atom(one.clone()).unwrap(), Some(one));
+    }
+
+    /// A member stored as its lexical form under a non-string item type — the
+    /// member of a list whose item type is a union — is typed `xs:string`.
+    #[test]
+    fn a_member_the_item_type_cannot_hold_is_typed_by_its_value() {
+        let list = XmlValue::new(
+            XmlTypeCode::Integer,
+            XmlValueKind::List {
+                item_type: XmlTypeCode::Integer,
+                items: vec![
+                    XmlAtomicValue::String("x".into()),
+                    XmlAtomicValue::Integer(BigInt::from(1)),
+                ],
+            },
+        );
+        assert_eq!(
+            describe(Atoms::of(list)),
+            [
+                (XmlTypeCode::String, "x".to_string()),
+                (XmlTypeCode::Integer, "1".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn unwrap_union_owned_moves_the_member_value_out() {
+        let inner = XmlValue::integer(BigInt::from(3));
+        let nested = XmlValue::new(
+            XmlTypeCode::Integer,
+            XmlValueKind::Union(Box::new(XmlValue::new(
+                XmlTypeCode::Integer,
+                XmlValueKind::Union(Box::new(inner.clone())),
+            ))),
+        );
+        assert_eq!(unwrap_union_owned(nested), inner);
+        assert_eq!(unwrap_union_owned(inner.clone()), inner);
     }
 
     // --- XPath 1.0 conversion tests ---

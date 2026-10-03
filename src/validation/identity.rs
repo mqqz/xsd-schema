@@ -499,6 +499,14 @@ pub(crate) struct ConstraintStruct {
     collection_stack: Vec<FieldCollectionFrame>,
     /// Key table accumulating complete key sequences.
     pub key_table: KeyTable,
+    /// Validation-stack index of the element whose declaration carries this
+    /// constraint (its scope element). Every violation of the constraint makes
+    /// *that* element invalid — Structures §3.3.4.3 Element Locally Valid
+    /// (Element) clause 6: "E is ·valid· with respect to each of the
+    /// {identity-constraint definitions} as per Identity-constraint Satisfied
+    /// (§3.11.4)" — whichever descendant the violation was detected at.
+    /// Set by the runtime when it activates the constraint.
+    pub owner_depth: usize,
 }
 
 impl ConstraintStruct {
@@ -516,6 +524,7 @@ impl ConstraintStruct {
             field_count: compiled.field_count,
             collection_stack: Vec::new(),
             key_table: KeyTable::new(compiled.key, compiled.name, compiled.kind),
+            owner_depth: 0,
         }
     }
 
