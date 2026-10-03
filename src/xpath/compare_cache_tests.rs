@@ -70,6 +70,16 @@ fn pairwise(
     }
 }
 
+/// The values the production path hands to the index for an operand made of
+/// `values`: its items atomized by `general_compare::atomize_items`, exactly as
+/// `install` and `probe` atomize them — so a packed list value (the stored
+/// typed value of a list-typed node) arrives as its members, as the pairwise
+/// loop sees it.
+fn atomized(values: &[XmlValue]) -> Vec<XmlValue> {
+    let items: Vec<XmlItem<Nav>> = values.iter().cloned().map(XmlItem::Atomic).collect();
+    general_compare::atomize_items(&items).expect("atomic items always atomize")
+}
+
 /// Run a whole stream of varying operands against **one** cached index and check
 /// every answer against the pairwise loop. Returns `(decided, total)`.
 fn check_stream(
@@ -79,7 +89,7 @@ fn check_stream(
     stream: &[Vec<XmlValue>],
     is_eq: bool,
 ) -> (usize, usize) {
-    let Some(mut operand) = CachedOperand::new(invariant.to_vec()) else {
+    let Some(mut operand) = CachedOperand::new(atomized(invariant)) else {
         // A value whose comparison class is not modelled; no index is possible,
         // which the production path expresses by never installing one.
         return (0, 0);
@@ -90,10 +100,11 @@ fn check_stream(
         let (left, right) = side.order(varying.as_slice(), invariant);
         let expected = pairwise(context, left, right, is_eq);
         let active = crate::xpath::collation::resolve_default(context);
+        let probe_values = atomized(varying);
         let outcome = if is_eq {
-            indexed_eq(context, side, &mut operand, varying, active.as_ref())
+            indexed_eq(context, side, &mut operand, &probe_values, active.as_ref())
         } else {
-            indexed_ne(context, side, &mut operand, varying, active.as_ref())
+            indexed_ne(context, side, &mut operand, &probe_values, active.as_ref())
         };
         total += 1;
         let got: Result<bool, XPathError> = match outcome {

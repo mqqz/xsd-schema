@@ -1102,11 +1102,29 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             None => return TypedValue::Untyped,
         };
 
-        // Complex types: only TextOnly content produces typed values
-        // (ElementOnly/Mixed/Empty never produce typed values — validator.rs:1007)
+        // Complex types (XDM 1.0 §6.2.4): simple content is validated below.
+        // "If the element has a complex type with mixed content (including
+        // xs:anyType), its typed-value is its dm:string-value as an
+        // xs:untypedAtomic"; "If the element has a complex type with empty
+        // content, its typed-value is the empty sequence" — an empty list
+        // value, which atomizes to no item; element-only content has no typed
+        // value at all (FOTY0012 on atomization).
         if let TypeKey::Complex(_) = binding.type_key {
-            if binding.content_type != Some(ContentType::TextOnly) {
-                return TypedValue::Absent;
+            match binding.content_type {
+                Some(ContentType::TextOnly) => {}
+                Some(ContentType::Mixed) => return TypedValue::Untyped,
+                Some(ContentType::Empty) => {
+                    use crate::types::value::{XmlValue, XmlValueKind};
+                    use crate::types::XmlTypeCode;
+                    return TypedValue::Value(XmlValue::new(
+                        XmlTypeCode::UntypedAtomic,
+                        XmlValueKind::List {
+                            item_type: XmlTypeCode::UntypedAtomic,
+                            items: Vec::new(),
+                        },
+                    ));
+                }
+                Some(ContentType::ElementOnly) | None => return TypedValue::Absent,
             }
         }
 

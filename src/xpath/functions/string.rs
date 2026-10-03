@@ -83,16 +83,13 @@ pub fn string_join<N: DomNavigator>(
     let separator = atomize_to_string_required(args.pop().unwrap())?;
     let sequence = args.pop().unwrap();
 
-    // Collect all string values from the sequence
-    let strings: Result<Vec<String>, XPathError> = sequence
-        .into_vec()
-        .into_iter()
-        .map(|item| match item {
-            XmlItem::Atomic(v) => Ok(v.to_string_value()),
-            XmlItem::Node(n) => Ok(n.value()),
-        })
+    // `$arg1 as xs:string*`: the function conversion rules atomize the
+    // sequence (XPath 2.0 §3.1.5), so a node contributes its typed value — one
+    // string per member of a list-typed node — rather than its string value.
+    let strings: Vec<String> = atomize_sequence(sequence)?
+        .iter()
+        .map(|v| v.to_string_value())
         .collect();
-    let strings = strings?;
     let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
     let result = string_ops::string_join(&refs, &separator);
     Ok(XPathValue::string(result))

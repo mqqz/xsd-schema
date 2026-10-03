@@ -12,6 +12,7 @@ use crate::validation::info::ContentType;
 use crate::validation::runtime::determine_content_type;
 
 use super::ast::BinaryOpKind;
+use super::atomize::{self, Atoms};
 use super::collation::CollationRef;
 use super::error::XPathError;
 use super::iterator::{XmlItemRef, XmlNodeIterator};
@@ -345,18 +346,35 @@ impl<'s> NodeComparer<'s> {
 
     /// Clause 4(a): the two elements' typed values are deep-equal.
     ///
-    /// A nilled element's typed value is the empty sequence, which is
-    /// deep-equal only to another empty sequence.
+    /// A typed value is a sequence (XDM §3.3.1.2): a nilled element's is the
+    /// empty sequence, and a list-typed element's has one item per member.
+    /// The two sequences are compared by [`atoms_equal`](Self::atoms_equal).
     fn typed_values_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
-        match (
-            crate::xpath::atomize::atomize_node(left),
-            crate::xpath::atomize::atomize_node(right),
-        ) {
-            (Ok(Some(left_value)), Ok(Some(right_value))) => {
-                self.item_equal(&left_value, &right_value)
-            }
-            (Ok(None), Ok(None)) => true,
+        match (atomize::node_atoms(left), atomize::node_atoms(right)) {
+            (Ok(left_atoms), Ok(right_atoms)) => self.atoms_equal(left_atoms, right_atoms),
             _ => false,
+        }
+    }
+
+    /// Two typed values are deep-equal when they have the same length and their
+    /// items are pairwise deep-equal under the atomic rule — `eq`, with NaN
+    /// equal to NaN (F&O §15.3.1). Whatever list type carries the members plays
+    /// no part, so an `xs:IDREFS` value and a list-of-`xs:IDREF` value with the
+    /// same members are deep-equal.
+    fn atoms_equal(&self, mut left: Atoms, mut right: Atoms) -> bool {
+        if left.len() != right.len() {
+            return false;
+        }
+        loop {
+            match (left.next(), right.next()) {
+                (Some(left_value), Some(right_value)) => {
+                    if !self.item_equal(&left_value, &right_value) {
+                        return false;
+                    }
+                }
+                (None, None) => return true,
+                _ => return false,
+            }
         }
     }
 
@@ -486,7 +504,9 @@ impl<'s> NodeComparer<'s> {
             // arrived as an attribute's typed value or as a sequence item.
             // An untyped attribute is `xs:untypedAtomic` and compares as a
             // string either way, so nothing moves for unvalidated documents.
-            self.item_equal(&left_value, &right_value)
+            // A list-typed attribute's typed value is the sequence of its
+            // members, compared item by item.
+            self.atoms_equal(Atoms::of(left_value), Atoms::of(right_value))
         } else {
             self.values_equal_or_nan(&left_value, &right_value)
         }

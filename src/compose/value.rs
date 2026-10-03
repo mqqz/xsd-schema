@@ -12,7 +12,7 @@ use num_bigint::BigInt;
 use rust_decimal::Decimal;
 
 use crate::types::value::XmlValue;
-use crate::xpath::atomize::{atomize_node, to_number};
+use crate::xpath::atomize::{atomize_node, node_atoms, single_atom, to_number, Atoms};
 use crate::xpath::functions::effective_boolean_value;
 use crate::xpath::{XPathError, XPathValue, XmlItem};
 
@@ -91,7 +91,8 @@ impl<'a> Value<'a> {
     /// A node is atomized with
     /// [`atomize_node`], so an untyped
     /// element yields its `xs:untypedAtomic` string value and a typed one its
-    /// typed value. A nilled element contributes nothing.
+    /// typed value: one value per member when its type is a list type
+    /// (XDM §3.3.1.2). A nilled element contributes nothing.
     ///
     /// ```
     /// use bumpalo::Bump;
@@ -112,12 +113,8 @@ impl<'a> Value<'a> {
         let mut out = Vec::with_capacity(self.len());
         for item in self.iter() {
             match item {
-                XmlItem::Atomic(value) => out.push(value.clone()),
-                XmlItem::Node(node) => {
-                    if let Some(value) = atomize_node(node)? {
-                        out.push(value);
-                    }
-                }
+                XmlItem::Atomic(value) => out.extend(Atoms::of(value.clone())),
+                XmlItem::Node(node) => out.extend(node_atoms(node)?),
             }
         }
         Ok(out)
@@ -347,12 +344,18 @@ impl<'a> Value<'a> {
         }
     }
 
-    /// [`single`](Self::single), atomized.
+    /// [`single`](Self::single), atomized: `None` when the item atomizes to
+    /// the empty sequence (a nilled element, an empty list), `XPTY0004` when it
+    /// atomizes to more than one value (a list-typed node with several
+    /// members).
     fn atomize_single(&self) -> Result<Option<XmlValue>, ComposeError> {
         match self.single()? {
             None => Ok(None),
-            Some(XmlItem::Atomic(value)) => Ok(Some(value.clone())),
-            Some(XmlItem::Node(node)) => Ok(atomize_node(node)?),
+            Some(XmlItem::Atomic(value)) => Ok(single_atom(value.clone())?),
+            Some(XmlItem::Node(node)) => match atomize_node(node)? {
+                None => Ok(None),
+                Some(value) => Ok(single_atom(value)?),
+            },
         }
     }
 }
@@ -723,6 +726,46 @@ mod tests {
             }
             other => panic!("expected XPTY0004, got {other:?}"),
         }
+    }
+
+    /// A packed list value — the stored typed value of a list-typed node —
+    /// atomizes to its members, one per member (XDM §3.3.1.2), and a singleton
+    /// accessor takes at most one of them.
+    #[test]
+    fn a_packed_list_value_atomizes_to_its_members() {
+        use crate::types::value::{XmlAtomicValue, XmlValueKind};
+        use crate::types::XmlTypeCode;
+
+        let list = |members: &[i64]| -> Value<'_> {
+            XPathValue::from_atomic(XmlValue::new(
+                XmlTypeCode::Integer,
+                XmlValueKind::List {
+                    item_type: XmlTypeCode::Integer,
+                    items: members
+                        .iter()
+                        .map(|&m| XmlAtomicValue::Integer(BigInt::from(m)))
+                        .collect(),
+                },
+            ))
+            .into()
+        };
+
+        let two = list(&[4, 5]);
+        let atomics = two.atomics().unwrap();
+        assert_eq!(atomics.len(), 2);
+        assert!(atomics.iter().all(|v| v.type_code == XmlTypeCode::Integer));
+        assert_eq!(atomics[1].to_string_value(), "5");
+        match two.key() {
+            Err(ComposeError::XPath { source, .. }) => {
+                assert_eq!(source.error_code(), Some("XPTY0004"));
+            }
+            other => panic!("expected XPTY0004, got {other:?}"),
+        }
+
+        assert_eq!(list(&[6]).number().unwrap(), 6.0);
+        assert!(list(&[]).number().unwrap().is_nan());
+        assert!(list(&[]).key().unwrap().is_none());
+        assert!(list(&[]).atomics().unwrap().is_empty());
     }
 
     #[test]

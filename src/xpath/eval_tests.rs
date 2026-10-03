@@ -4755,3 +4755,429 @@ mod kind_test_prefix_tests {
         );
     }
 }
+
+/// XDM 1.0 §3.3.1.2 and XPath 2.0 §2.4.2 / §2.5.2 — atomizing a node whose type
+/// is a list type yields one atomic value per list member, each of the list's
+/// item type; the string value of the node stays the whole text.
+mod list_atomization_tests {
+    use bumpalo::Bump;
+
+    use crate::document::typed_builder::build_typed_document;
+    use crate::document::BufferDocumentOptions;
+    use crate::namespace::context::NamespaceContextSnapshot;
+    use crate::pipeline::load_and_process_schema;
+    use crate::schema::SchemaSet;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::iterator::XmlItem;
+    use crate::xpath::XPathContext;
+
+    const SCHEMA: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+      <xs:simpleType name="idList"><xs:list itemType="xs:ID"/></xs:simpleType>
+      <xs:simpleType name="idrefList"><xs:list itemType="xs:IDREF"/></xs:simpleType>
+      <xs:simpleType name="intList"><xs:list itemType="xs:integer"/></xs:simpleType>
+      <xs:simpleType name="dblList"><xs:list itemType="xs:double"/></xs:simpleType>
+      <xs:simpleType name="intOrString">
+        <xs:union memberTypes="xs:integer xs:string"/>
+      </xs:simpleType>
+      <xs:simpleType name="mixedList"><xs:list itemType="intOrString"/></xs:simpleType>
+      <xs:simpleType name="intOrFloat">
+        <xs:union memberTypes="xs:integer xs:float"/>
+      </xs:simpleType>
+      <xs:simpleType name="numList"><xs:list itemType="intOrFloat"/></xs:simpleType>
+      <xs:complexType name="intListWithKind">
+        <xs:simpleContent>
+          <xs:extension base="intList">
+            <xs:attribute name="kind" type="xs:string"/>
+          </xs:extension>
+        </xs:simpleContent>
+      </xs:complexType>
+      <xs:element name="doc">
+        <xs:complexType>
+          <xs:sequence>
+            <xs:element name="l" type="xs:NMTOKENS"/>
+            <xs:element name="sc" type="intListWithKind"/>
+            <xs:element name="ni" type="xs:integer" nillable="true"/>
+            <xs:element name="d" type="dblList" maxOccurs="unbounded"/>
+            <xs:element name="p" maxOccurs="unbounded">
+              <xs:complexType>
+                <xs:attribute name="n" type="intList"/>
+                <xs:attribute name="r" type="idrefList"/>
+              </xs:complexType>
+            </xs:element>
+            <xs:element name="lu" type="numList"/>
+            <xs:element name="any"/>
+            <xs:element name="mx">
+              <xs:complexType mixed="true">
+                <xs:sequence><xs:element name="i" type="xs:string"/></xs:sequence>
+              </xs:complexType>
+            </xs:element>
+            <xs:element name="emp">
+              <xs:complexType><xs:attribute name="k" type="xs:string"/></xs:complexType>
+            </xs:element>
+          </xs:sequence>
+          <xs:attribute name="l" type="idList"/>
+          <xs:attribute name="one" type="idList"/>
+          <xs:attribute name="n" type="intList"/>
+          <xs:attribute name="n1" type="intList"/>
+          <xs:attribute name="e" type="intList"/>
+          <xs:attribute name="r" type="xs:IDREFS"/>
+          <xs:attribute name="m" type="mixedList"/>
+          <xs:attribute name="m2" type="mixedList"/>
+          <xs:attribute name="b" type="xs:boolean"/>
+        </xs:complexType>
+      </xs:element>
+    </xs:schema>"#;
+
+    const INSTANCE: &str = concat!(
+        r#"<doc l="a b" one="c" n="1 2 3" n1=" 5 " e="" r="a b" m="1 x" m2="x 1" b="true""#,
+        r#" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#,
+        r#"<l>p q</l><sc kind="k">4 5</sc><ni xsi:nil="true"/>"#,
+        r#"<d>1 NaN</d><d> 1  NaN </d><d>1 2</d>"#,
+        r#"<p n="1 2 3" r="a b"/><p n=" 1  2   3 " r="c"/><p n="1 2 4"/><lu>1 1.0e0</lu>"#,
+        r#"<any>text</any><mx>a<i>b</i>c</mx><emp k="v"/>"#,
+        r#"</doc>"#
+    );
+
+    /// Evaluate every `(expression, expected)` pair over the validated
+    /// instance and report all mismatches at once. A result is its items'
+    /// string values joined by `|`, `()` for the empty sequence, `<node>` for a
+    /// node, and `error:CODE` for an error.
+    fn check(cases: &[(&str, &str)], compat: bool) {
+        let mut schema_set = SchemaSet::xsd11();
+        load_and_process_schema(SCHEMA.as_bytes(), "test.xsd", &mut schema_set, None)
+            .expect("the fixture schema loads");
+        let arena = Bump::new();
+        let doc = build_typed_document(
+            INSTANCE.as_bytes(),
+            &arena,
+            &schema_set,
+            BufferDocumentOptions::default(),
+        )
+        .expect("the fixture document is built");
+        let mut namespaces = NamespaceContextSnapshot::default();
+        namespaces.bindings.push((
+            schema_set.name_table.add("xs"),
+            schema_set
+                .name_table
+                .add("http://www.w3.org/2001/XMLSchema"),
+        ));
+        let ctx = XPathContext::new(&schema_set.name_table)
+            .with_namespaces(namespaces)
+            .with_schema_set(&schema_set)
+            .with_xpath10_compatibility(compat);
+
+        let code = |e: crate::xpath::XPathError| {
+            format!(
+                "error:{}",
+                e.error_code()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("<no code> {e}"))
+            )
+        };
+        let mut wrong = Vec::new();
+        for (expr, expected) in cases {
+            let got = match XPathExpr::compile(expr, &ctx) {
+                Err(e) => code(e),
+                Ok(compiled) => match compiled
+                    .evaluator(&ctx)
+                    .run_with_node(doc.create_navigator())
+                {
+                    Err(e) => code(e),
+                    Ok(value) if value.is_empty() => "()".to_string(),
+                    Ok(value) => value
+                        .into_vec()
+                        .iter()
+                        .map(|item| match item {
+                            XmlItem::Atomic(v) => v.to_string_value(),
+                            XmlItem::Node(_) => "<node>".to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                },
+            };
+            if got != *expected {
+                wrong.push(format!("{expr}  =>  {got}   (expected {expected})"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} cases wrong:\n{}",
+            wrong.len(),
+            cases.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// `fn:data` and the typed value: one item per member, typed with the
+    /// list's item type; `fn:string` is untouched.
+    #[test]
+    fn data_yields_one_item_per_member() {
+        check(
+            &[
+                ("count(data(/doc/@l))", "2"),
+                ("data(/doc/@l)", "a|b"),
+                ("data(/doc/@l)[1] instance of xs:ID", "true"),
+                ("data(/doc/@l)[2] instance of xs:ID", "true"),
+                ("data(/doc/@l) instance of xs:ID", "false"),
+                ("data(/doc/@l) instance of xs:ID+", "true"),
+                ("count(data(/doc/@one))", "1"),
+                ("data(/doc/@one) instance of xs:ID", "true"),
+                ("data(/doc/@n)[1] instance of xs:integer", "true"),
+                ("data(/doc/@n)", "1|2|3"),
+                ("string(/doc/@l)", "a b"),
+                ("string(/doc/l)", "p q"),
+                ("string(/doc/sc)", "4 5"),
+                // The empty list: the typed value is the empty sequence.
+                ("data(/doc/@e)", "()"),
+                ("count(data(/doc/@e))", "0"),
+                // A simple-typed list element and a complex type with simple
+                // content of a list type.
+                ("count(data(/doc/l))", "2"),
+                ("data(/doc/l)[2] instance of xs:NMTOKEN", "true"),
+                ("count(data(/doc/sc))", "2"),
+                ("data(/doc/sc)[2] instance of xs:integer", "true"),
+                // The built-in list types.
+                ("count(data(/doc/@r))", "2"),
+                ("data(/doc/@r)[1] instance of xs:IDREF", "true"),
+                ("data(/doc/@r) instance of xs:IDREFS", "error:XPST0051"),
+                // A nilled element has the empty sequence as its typed value.
+                ("count(data(/doc/ni))", "0"),
+            ],
+            false,
+        );
+    }
+
+    /// XPath 2.0 §3.5.2: a general comparison is existential over the atomized
+    /// operands, so over the members.
+    #[test]
+    fn general_comparisons_see_every_member() {
+        check(
+            &[
+                ("/doc/@l = 'b'", "true"),
+                ("/doc/@l = 'a b'", "false"),
+                ("/doc/@l != 'a'", "true"),
+                ("'b' = /doc/@l", "true"),
+                ("/doc/@n = 2", "true"),
+                ("/doc/@n > 2", "true"),
+                ("/doc/@n < 1", "false"),
+                ("/doc/@n >= 3", "true"),
+                ("/doc/l = 'q'", "true"),
+                ("/doc/@r = 'b'", "true"),
+                ("/doc/sc = 5", "true"),
+                ("/doc/@e = 1", "false"),
+                ("/doc/@l = /doc/@r", "true"),
+                ("/doc/@n = (7, 8, 3)", "true"),
+                ("(7, 8, 3) = /doc/@n", "true"),
+            ],
+            false,
+        );
+    }
+
+    /// XPath 2.0 §3.5.1 / §3.4: more than one member is a type error, none is
+    /// the empty sequence, and exactly one is that member.
+    #[test]
+    fn value_comparisons_and_arithmetic_take_at_most_one_member() {
+        check(
+            &[
+                ("/doc/@l eq 'b'", "error:XPTY0004"),
+                ("/doc/@one eq 'c'", "true"),
+                ("/doc/@n + 1", "error:XPTY0004"),
+                ("/doc/@n1 + 1", "6"),
+                ("/doc/@n1 eq 5", "true"),
+                ("-/doc/@n1", "-5"),
+                ("/doc/@e eq 1", "()"),
+                ("/doc/@e + 1", "()"),
+                ("xs:string(/doc/@l)", "error:XPTY0004"),
+                ("/doc/@l castable as xs:string", "false"),
+                ("/doc/@one cast as xs:string", "c"),
+                ("/doc/@n1 to 6", "5|6"),
+            ],
+            false,
+        );
+    }
+
+    /// XPath 2.0 §3.5.1 / §3.4 on a nilled element, whose typed value is the
+    /// empty sequence.
+    #[test]
+    fn a_nilled_element_is_the_empty_sequence_in_value_comparisons_and_arithmetic() {
+        check(
+            &[
+                ("/doc/ni eq 1", "()"),
+                ("/doc/ni + 1", "()"),
+                ("-/doc/ni", "()"),
+                ("/doc/ni castable as xs:integer?", "true"),
+                ("/doc/ni castable as xs:integer", "false"),
+                ("/doc/ni = 1", "false"),
+            ],
+            false,
+        );
+    }
+
+    /// Functions that atomize their arguments see the members.
+    #[test]
+    fn functions_see_every_member() {
+        check(
+            &[
+                ("sum(data(/doc/@n))", "6"),
+                ("sum(/doc/@n)", "6"),
+                ("avg(/doc/@n)", "2"),
+                ("min(/doc/@n)", "1"),
+                ("max(/doc/@n)", "3"),
+                ("sum(/doc/sc)", "9"),
+                ("distinct-values(/doc/@l)", "a|b"),
+                // (`index-of` compares a derived string type with an
+                // `xs:string` structurally, a separate defect, so the search
+                // value is an `xs:ID` here.)
+                ("index-of(/doc/@l, xs:ID('b'))", "2"),
+                ("index-of(/doc/@n, 3)", "3"),
+                ("string-join(data(/doc/@l), ',')", "a,b"),
+                ("some $x in data(/doc/@n) satisfies $x eq 2", "true"),
+                ("deep-equal(data(/doc/@l), ('a', 'b'))", "true"),
+                ("abs(/doc/@n1)", "5"),
+                ("abs(/doc/@e)", "()"),
+                ("exactly-one(data(/doc/@one))", "c"),
+                // The effective boolean value of two atomic values is an error
+                // (XPath 2.0 §2.4.3); of one string, its non-emptiness.
+                ("boolean(data(/doc/@l))", "error:FORG0006"),
+                ("boolean(data(/doc/@one))", "true"),
+            ],
+            false,
+        );
+    }
+
+    /// The function conversion rules (XPath 2.0 §3.1.5) atomize a node
+    /// argument; they do not read its string value.
+    #[test]
+    fn function_conversion_atomizes_a_typed_node() {
+        check(
+            &[
+                ("number(/doc/@b)", "1"),
+                ("number(/doc/@n1)", "5"),
+                ("number(/doc/@n)", "error:XPTY0004"),
+                ("number(/doc/@e)", "NaN"),
+                ("concat(/doc/@n1, '')", "5"),
+                ("string-join(/doc/@l, ',')", "a,b"),
+                ("upper-case(/doc/@l)", "error:XPTY0004"),
+                ("upper-case(/doc/@one)", "C"),
+                ("string-length(/doc/@e)", "0"),
+                ("compare(/doc/@e, 'a')", "()"),
+                ("compare(/doc/ni, 'a')", "()"),
+                ("contains(/doc/@one, 'c')", "true"),
+                ("substring(/doc/@one, 1)", "c"),
+                // An element with element-only content has no typed value
+                // (XPath 2.0 §2.4.2, XDM §3.3.1.3).
+                ("string-length(/doc)", "error:FOTY0012"),
+                // …while fn:string and the zero-argument forms keep reading the
+                // string value.
+                ("string-length(string(/doc/@l))", "3"),
+                ("/doc/@l/string-length()", "3"),
+                ("/doc/@l/normalize-space()", "a b"),
+            ],
+            false,
+        );
+    }
+
+    /// XPath 2.0 §3.5.2 / §3.4 in XPath 1.0 compatibility mode: the
+    /// conversions apply to each member.
+    #[test]
+    fn compatibility_mode_compares_member_by_member() {
+        check(
+            &[
+                ("/doc/@l = 'b'", "true"),
+                ("/doc/@l = 'a b'", "false"),
+                ("/doc/@n = 2", "true"),
+                ("/doc/@n = '2'", "true"),
+                ("/doc/@n > 2", "true"),
+                ("/doc/@n < 1", "false"),
+                ("/doc/@n + 1", "2"),
+                ("/doc/@e + 1", "NaN"),
+                ("string(/doc/@l)", "a b"),
+            ],
+            true,
+        );
+    }
+
+    /// F&O §15.3.1: typed values are compared item by item, `eq` with NaN equal
+    /// to NaN, whatever list type carries them.
+    #[test]
+    fn deep_equal_compares_list_typed_values_member_by_member() {
+        check(
+            &[
+                // Equal members, different whitespace.
+                ("deep-equal(/doc/p[1]/@n, /doc/p[2]/@n)", "true"),
+                // Different members.
+                ("deep-equal(/doc/p[1]/@n, /doc/p[3]/@n)", "false"),
+                // Simple-content elements whose members include NaN.
+                ("deep-equal(/doc/d[1], /doc/d[2])", "true"),
+                ("deep-equal(/doc/d[1], /doc/d[3])", "false"),
+                // xs:IDREFS against a user-defined list of xs:IDREF.
+                ("deep-equal(/doc/@r, /doc/p[1]/@r)", "true"),
+                ("deep-equal(/doc/@r, /doc/p[2]/@r)", "false"),
+            ],
+            false,
+        );
+    }
+
+    /// XDM 1.0 §6.2.4: an element of a complex type with mixed content —
+    /// `xs:anyType` included — has its string value as an `xs:untypedAtomic`
+    /// typed value, one with empty content has the empty sequence, and only
+    /// element-only content has no typed value.
+    #[test]
+    fn complex_content_typed_values_follow_xdm() {
+        check(
+            &[
+                ("data(/doc/any)", "text"),
+                ("data(/doc/any) instance of xs:untypedAtomic", "true"),
+                ("/doc/any = 'text'", "true"),
+                ("string-length(/doc/any)", "4"),
+                ("data(/doc/mx)", "abc"),
+                ("/doc/mx = 'abc'", "true"),
+                ("data(/doc/emp)", "()"),
+                ("count(data(/doc/emp))", "0"),
+                ("string-length(/doc/emp)", "0"),
+                ("/doc/emp eq 'x'", "()"),
+                ("data(/doc)", "error:FOTY0012"),
+                ("/doc = 'x'", "error:FOTY0012"),
+            ],
+            false,
+        );
+    }
+
+    /// XQTS `Constr-cont-constrmod-6` (XQuery-only, so not in the XPath
+    /// selection): `fn:count(fn:data(…/@attr))` of an `xs:IDREFS` attribute
+    /// holding `id1 id2` is `2`.
+    #[test]
+    fn xqts_constr_cont_constrmod_6_essence() {
+        check(&[("count(data(/doc/@r))", "2")], false);
+    }
+
+    /// A list whose item type is a union: one item per member.
+    ///
+    /// The member type actually chosen (XDM §3.3.1.2) is not recorded per
+    /// member, so a member is typed with the list's recorded item type, or
+    /// `xs:string` when it holds a lexical form that type cannot hold — and an
+    /// operation on it then fails with an error code, never an internal error.
+    #[test]
+    fn a_list_of_a_union_yields_one_item_per_member() {
+        check(
+            &[
+                ("count(data(/doc/@m))", "2"),
+                ("data(/doc/@m)", "1|x"),
+                ("/doc/@m = 'x'", "true"),
+                ("data(/doc/@m2)", "x|1"),
+                ("data(/doc/@m2)[1] instance of xs:string", "true"),
+                ("data(/doc/@m2)[1] instance of xs:integer", "false"),
+                ("/doc/@m2 = 'x'", "true"),
+                // The specification's answer is 2 (the member is an
+                // xs:integer); without the chosen member type it is a type
+                // error with its code.
+                ("data(/doc/@m2)[2] + 1", "error:XPTY0004"),
+                // XQTS `validateexpr-24` (XQuery-only): a list of a union of
+                // xs:integer and xs:float, `1 1.0e0`, has two items.
+                ("count(data(/doc/lu))", "2"),
+                ("data(/doc/lu)", "1|1"),
+            ],
+            false,
+        );
+    }
+}

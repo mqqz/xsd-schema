@@ -41,11 +41,19 @@ pub enum NavigatorError {
 /// | `Untyped` | No schema — atomizes to untypedAtomic |
 /// | `Nilled`  | `xsi:nil="true"` — empty sequence     |
 /// | `Absent`  | Element-only complex content (FOTY0012)|
+///
+/// A list type's typed value is one `Value` of kind
+/// [`XmlValueKind::List`](crate::types::value::XmlValueKind::List), which XPath
+/// atomization sees as one atomic value per member; an element whose complex
+/// type has empty content has an empty list as its `Value` (XDM 1.0 §6.2.4:
+/// the empty sequence).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedValue {
     /// Schema-validated typed atomic value.
     Value(XmlValue),
-    /// Untyped node (no schema) — atomizes to `xs:untypedAtomic`.
+    /// Untyped node (no schema), or an element whose complex type has mixed
+    /// content, `xs:anyType` included (XDM 1.0 §6.2.4) — atomizes to its
+    /// string value as `xs:untypedAtomic`.
     Untyped,
     /// Nilled element (`xsi:nil="true"`) — typed value is empty sequence.
     Nilled,

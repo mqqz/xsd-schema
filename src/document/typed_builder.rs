@@ -409,7 +409,7 @@ mod tests {
         );
     }
 
-    // ── Test 4: typed_value() returns Absent for ElementOnly/Mixed ────
+    // ── Test 4: typed_value() returns Absent for ElementOnly ──────────
 
     #[test]
     fn typed_value_absent_for_element_only() {

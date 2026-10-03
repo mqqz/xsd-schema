@@ -35,8 +35,8 @@ use crate::xpath::cast::{cast_to, castable, occurrence_allows_count, resolved_ty
 use crate::xpath::context::{DynamicContext, XPathContext};
 use crate::xpath::error::XPathError;
 use crate::xpath::functions::{
-    atomize_sequence, atomize_to_double, atomize_to_single_opt, atomize_to_string,
-    effective_boolean_value, effective_boolean_value_10, XPathValue,
+    atomize_sequence, atomize_to_double, atomize_to_single_opt, effective_boolean_value,
+    effective_boolean_value_10, string_of_single, XPathValue,
 };
 use crate::xpath::iterator::{
     DocumentOrderNodeIterator, VecNodeIterator, XmlItem, XmlNodeIterator,
@@ -938,9 +938,10 @@ fn apply_function_conversion_10<N: DomNavigator>(
         let taken = std::mem::replace(arg, XPathValue::empty());
         *arg = match expected.item_type {
             // `fn:string` of the empty sequence is the zero-length string, and
-            // of a single item its string value.
+            // of a single item its string value — for a node, its string value
+            // rather than its typed value.
             ItemType::AtomicType(XmlTypeCode::String) => {
-                XPathValue::string(atomize_to_string(first_item(taken))?)
+                XPathValue::string(string_of_single(first_item(taken))?)
             }
             // `fn:number` of the empty sequence is NaN.
             ItemType::AtomicType(XmlTypeCode::Double) => {

@@ -79,6 +79,7 @@ use rust_decimal::Decimal;
 use crate::namespace::qname::QualifiedName;
 use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
+use crate::xpath::atomize::push_atoms;
 use crate::xpath::collation::CollationRef;
 use crate::xpath::context::XPathContext;
 use crate::xpath::error::XPathError;
@@ -174,15 +175,17 @@ where
     Some((lvals, rvals))
 }
 
-/// Atomize a materialized sequence, dropping nilled items. `None` on any error,
-/// for the same reason [`atomize_all`] gives.
+/// Atomize a materialized sequence, dropping nilled items and splitting a
+/// list-typed node into its members — the very values, in the very order, the
+/// pairwise loop walks. `None` on any error, for the same reason
+/// [`atomize_all`] gives.
 pub(super) fn atomize_items<N: crate::xpath::DomNavigator>(
     items: &[XmlItem<N>],
 ) -> Option<Vec<XmlValue>> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         match atomize_item(XmlItemRef::from_item(item)) {
-            Ok(Some(value)) => out.push(value),
+            Ok(Some(value)) => push_atoms(value, &mut out),
             Ok(None) => {}
             Err(_) => return None,
         }
@@ -191,7 +194,8 @@ pub(super) fn atomize_items<N: crate::xpath::DomNavigator>(
 }
 
 /// Atomize a whole sequence, dropping nilled items (which atomize to the empty
-/// sequence and take part in no pair). `None` on any error.
+/// sequence and take part in no pair) and splitting a list-typed node into
+/// its members. `None` on any error.
 fn atomize_all<I: XmlNodeIterator>(iter: &I) -> Option<Vec<XmlValue>> {
     let mut cursor = iter.clone();
     let mut out = Vec::new();
@@ -203,7 +207,7 @@ fn atomize_all<I: XmlNodeIterator>(iter: &I) -> Option<Vec<XmlValue>> {
         }
         let item = cursor.current()?;
         match atomize_item(item) {
-            Ok(Some(value)) => out.push(value),
+            Ok(Some(value)) => push_atoms(value, &mut out),
             Ok(None) => {}
             Err(_) => return None,
         }

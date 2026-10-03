@@ -430,6 +430,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attribute's annotation on the node, so the new value was reported with the
   old type. The later attribute now wins with its annotation or the lack of
   one, and `BufferDocument::has_type_annotations` stays exact.
+- Atomizing a node whose type is a list type now yields one atomic value per
+  list member, each typed with the list's item type (XDM §3.3.1.2, XPath 2.0
+  §2.5.2). It yielded the whole list as a single value, so `data(@refs)` of an
+  `xs:IDREFS` attribute holding `a b` had one item, and every operator and
+  function saw that one value. This changes answers that a schema-aware host
+  can observe: `@refs = 'b'` is now true where it was false (or raised
+  `XPTY0004` for a built-in list type such as `xs:NMTOKENS` or `xs:IDREFS`),
+  and `@refs = 'a b'` is now false where it was true; `@refs eq 'b'`,
+  arithmetic on a list of several members and `xs:string(@refs)` now raise
+  `XPTY0004` instead of answering (or failing with an error that had no code);
+  `sum()`, `avg()`, `min()` and `max()` of a list of numbers add and compare
+  the members instead of returning the list's text; `count(data(@refs))`,
+  `distinct-values()`, `index-of()`, `string-join()` and `deep-equal()` see
+  the members; a list with no members atomizes to the empty sequence. XPath
+  1.0 compatibility mode applies its conversions to each member. The string
+  value of such a node, and `fn:string`, are unchanged: still the whole text.
+  `atomize::atomize_node` still returns the typed value as it is stored, one
+  value of kind `XmlValueKind::List`. For a list whose item type is a union,
+  the member type the validator actually chose is not recorded per member:
+  each member is typed with the list's recorded item type, or `xs:string`
+  when it holds a lexical form that type cannot hold.
+- A nilled element, whose typed value is the empty sequence, now makes a value
+  comparison, an arithmetic expression or a unary `+`/`-` return the empty
+  sequence, as XPath 2.0 §3.4 and §3.5.1 require, instead of raising
+  `XPTY0004`; `castable as T?` of it is true and `castable as T` false.
+- The arguments of the built-in functions are now atomized as the function
+  conversion rules require (XPath 2.0 §3.1.5): a node contributes its typed
+  value, not its string value. A schema-aware host sees the difference:
+  `fn:number(@flag)` of an `xs:boolean` attribute `true` is now `1` instead of
+  `NaN`, `concat(@n, '')` of an `xs:integer` attribute ` 5 ` is `5`, a string
+  argument whose typed value has several members raises `XPTY0004`, an empty
+  typed value is the empty sequence (so `compare(@empty, 'a')` is the empty
+  sequence), and an element with element-only content passed where a string or
+  number is expected raises `FOTY0012`, because it has no typed value.
+  `fn:string`, the zero-argument string functions (`string-length()`,
+  `normalize-space()`), and the `fn:string(V)` step of XPath 1.0
+  compatibility mode keep reading the string value. Untyped nodes are
+  unaffected: their typed value is their string value.
+- An element whose complex type has mixed content — `xs:anyType` included — now
+  has its string value as an `xs:untypedAtomic` typed value, and one whose
+  complex type has empty content has the empty sequence, as XDM §6.2.4
+  requires. `BufferDocNavigator::typed_value` reported both as having no typed
+  value (`TypedValue::Absent`), so atomizing such an element — in a
+  comparison, in `fn:data`, in an XSD 1.1 assertion — raised `FOTY0012`. It now
+  returns `TypedValue::Untyped` for mixed content and an empty list value for
+  empty content; element-only content is still `Absent`.
+- `fn:deep-equal` compares two typed values item by item, as F&O §15.3.1
+  requires of the typed values of two simple-content elements or two
+  attributes: same length, and each pair equal under `eq`, with `NaN` equal to
+  `NaN`. A list-typed value was compared as one value, so two lists whose
+  members include `NaN`, or an `xs:IDREFS` value and a list-of-`xs:IDREF`
+  value with the same members, were reported different. `TreeComparer` is
+  unchanged.
 
 ### Added
 

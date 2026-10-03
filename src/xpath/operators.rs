@@ -21,6 +21,7 @@ use crate::types::value::{
 };
 use crate::types::XmlTypeCode;
 use crate::xpath::ast::{BinaryOpKind, UnaryOpKind};
+use crate::xpath::atomize::{self, ListMembers};
 use crate::xpath::cast::cast_to;
 use crate::xpath::collation::{self, CollationRef};
 use crate::xpath::context::XPathContext;
@@ -2329,12 +2330,76 @@ pub fn magnitude_relationship_ctx(
     Ok((left_result, right_result))
 }
 
+/// The value one item of a general-comparison operand atomizes to, as it is
+/// stored: an atomic value as it is, a node's typed value (`None` for a nilled
+/// element). A list-typed node's typed value comes back packed; the callers
+/// take it apart with [`atomize::unpack_list`] — [`AtomCursor`] for the
+/// pairwise loops, `general_compare`'s atomizers for the hash index.
 pub(super) fn atomize_item<N: DomNavigator>(
     item: XmlItemRef<'_, N>,
 ) -> Result<Option<XmlValue>, XPathError> {
     match item {
         XmlItemRef::Atomic(value) => Ok(Some(value.clone())),
-        XmlItemRef::Node(node) => crate::xpath::atomize::atomize_node(node),
+        XmlItemRef::Node(node) => atomize::atomize_node(node),
+    }
+}
+
+/// A cursor over the atomized values of a general-comparison operand, in
+/// order (XPath 2.0 §3.5.2: "Atomization is applied to each operand").
+///
+/// A nilled element contributes no value and a list-typed node one value per
+/// member, so the pairwise loops below walk the Cartesian product of the two
+/// atomized operands in row-major order. Each item is atomized when the cursor
+/// reaches it, never before, so an item that cannot be atomized raises its
+/// error exactly where the loop meets it. A value that is not a list costs two
+/// discriminant tests more than the item itself: no list in progress, and not
+/// a packed list ([`atomize::is_packed_list`]).
+struct AtomCursor<I: XmlNodeIterator> {
+    items: I,
+    /// The members of the list being walked, if the current item was one.
+    pending: Option<ListMembers>,
+}
+
+impl<I: XmlNodeIterator> AtomCursor<I> {
+    fn new(items: I) -> Self {
+        Self {
+            items,
+            pending: None,
+        }
+    }
+
+    /// The next atomized value, or `None` at the end of the operand.
+    #[inline]
+    fn next_atom(&mut self) -> Result<Option<XmlValue>, XPathError> {
+        if let Some(members) = &mut self.pending {
+            if let Some(member) = members.next() {
+                return Ok(Some(member));
+            }
+            self.pending = None;
+        }
+        while self.items.move_next()? {
+            let item = self
+                .items
+                .current()
+                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+            let Some(value) = atomize_item(item)? else {
+                continue; // nilled → no value
+            };
+            if !atomize::is_packed_list(&value) {
+                return Ok(Some(value));
+            }
+            match atomize::unpack_list(value) {
+                Ok(mut members) => {
+                    if let Some(first) = members.next() {
+                        self.pending = Some(members);
+                        return Ok(Some(first));
+                    }
+                    // An empty list contributes no value.
+                }
+                Err(value) => return Ok(Some(value)),
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -2521,7 +2586,7 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
     let mut remaining = budget;
     // XPath 2.0 §3.5.2 lets a general comparison return true as soon as it finds
     // a pair with the required magnitude relationship, so an incomparable pair
@@ -2530,24 +2595,10 @@ where
     // comparison is a type error (§3.5.1).
     let mut deferred: Option<XPathError> = None;
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             if remaining == 0 {
                 return Ok(None);
             }
@@ -2627,7 +2678,7 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
     let mut remaining = budget;
     // An incomparable pair is *not* an unequal pair: §3.5.2 defers to the `ne`
     // value comparison, and §3.5.1 makes an incomparable `ne` a type error. The
@@ -2635,24 +2686,10 @@ where
     // allows to decide the comparison on its own.
     let mut deferred: Option<XPathError> = None;
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             if remaining == 0 {
                 return Ok(None);
             }
@@ -2689,26 +2726,12 @@ where
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
     let active = collation::resolve_default(context);
     let collation = active.as_ref();
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_lt_collated(&l, &r, collation) {
@@ -2734,26 +2757,12 @@ where
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
     let active = collation::resolve_default(context);
     let collation = active.as_ref();
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_eq_collated(&l, &r, collation) {
@@ -2786,26 +2795,12 @@ where
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
     let active = collation::resolve_default(context);
     let collation = active.as_ref();
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_gt_collated(&l, &r, collation) {
@@ -2831,26 +2826,12 @@ where
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
     let active = collation::resolve_default(context);
     let collation = active.as_ref();
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_eq_collated(&l, &r, collation) {
@@ -3048,26 +3029,12 @@ where
     I2: XmlNodeIterator,
 {
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let mut left_iter = left.clone();
+    let mut left_atoms = AtomCursor::new(left.clone());
 
-    while left_iter.move_next()? {
-        let left_item = left_iter
-            .current()
-            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = match atomize_item(left_item)? {
-            Some(v) => v,
-            None => continue, // nilled → skip
-        };
-        let mut right_iter = right_buf.clone();
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
 
-        while right_iter.move_next()? {
-            let right_item = right_iter
-                .current()
-                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = match atomize_item(right_item)? {
-                Some(v) => v,
-                None => continue, // nilled → skip
-            };
+        while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = coerce_for_comparison_10(op, &left_value, &right_value);
 
             let compared = match op {
