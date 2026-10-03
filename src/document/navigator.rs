@@ -85,7 +85,9 @@ impl<'a> BufferDocNavigator<'a> {
     /// yields nothing: `parent::`, `ancestor::`, `ancestor-or-self::` beyond
     /// `E`, `following-sibling::`, `preceding-sibling::`, `following::` and
     /// `preceding::` are all cut at `E` (see
-    /// the private `is_tree_top`).
+    /// the private `is_tree_top`). For the same reason
+    /// [`find_element_by_id`](DomNavigator::find_element_by_id) — and with it
+    /// `fn:id` — answers only with an element inside `E`.
     ///
     /// `fn:root()` and the absolute paths built on it are the one place this
     /// differs from [`new_orphan`](Self::new_orphan): they still land on the
@@ -116,11 +118,35 @@ impl<'a> BufferDocNavigator<'a> {
     /// document node that physically holds it, and it has no siblings. Its
     /// descendants behave normally and reach it with `move_to_parent`.
     ///
-    /// Unlike [`new_assertion`](Self::new_assertion), which only hides the
-    /// synthetic root from `/` and `//`, this also cuts the upward links —
-    /// which is what makes `fn:root()`, `parent::node()` and `..` agree that
-    /// the node is the root of its own tree.
+    /// So `parent::`, `ancestor::`, the sibling axes, `following::` and
+    /// `preceding::` all stop at `node`, and `fn:root()` and `..` agree that it
+    /// is the root of its own tree. The scope of an id is that tree as well:
+    /// [`find_element_by_id`](DomNavigator::find_element_by_id) answers with
+    /// the first element *inside the subtree of `node`* that has the id.
+    ///
+    /// [`new_assertion`](Self::new_assertion) cuts the same upward and
+    /// sideways links at the asserted element; the two differ only in
+    /// `fn:root()` and the absolute paths built on it, which under
+    /// `new_assertion` deliberately still reach the hidden document node (and
+    /// select nothing below it). Here `fn:root()` lands on `node`, so a leading
+    /// `/` or `//` — `fn:root(self::node()) treat as document-node()`, XPath 2.0
+    /// §3.2 — raises `XPDY0050` when `node` is not a document node.
+    ///
+    /// The document node already has no parent and no siblings, so
+    /// `new_orphan(doc, doc.root())` is the ordinary navigator
+    /// ([`new`](Self::new)).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `node` is not a node of `doc`.
     pub fn new_orphan(doc: &'a BufferDocument<'a>, node: u32) -> Self {
+        assert!(
+            doc.has_node(node),
+            "new_orphan: {node} is not a node of this document"
+        );
+        if node == doc.root || doc.nodes.get(node).node_type() == NodeType::Root {
+            return Self::new(doc, node);
+        }
         Self {
             assertion_absolute_root: true,
             assertion_fragment_root: node,
@@ -1163,18 +1189,29 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
     }
 
     /// The scope of an id is one tree: the search is anchored on this cursor's
-    /// own tree, so a buffer holding several top-level trees never lets one
-    /// reach into another. A cursor presented as parentless
-    /// ([`new_orphan`](Self::new_orphan)) is the root of its own tree, so the
-    /// hit must also lie inside its subtree.
+    /// own tree (see [`BufferDocument::get_element_by_id_in_tree`] for which
+    /// nodes make up one), so a buffer holding several top-level trees never
+    /// lets one reach into another.
+    ///
+    /// Under [`new_orphan`](Self::new_orphan) and
+    /// [`new_assertion`](Self::new_assertion) the visible tree is the subtree
+    /// of the parentless node or of the asserted element `E` — XSD 1.1
+    /// §3.13.4.1 clause 1.3: the assertion's data model instance "contains
+    /// only that node and nodes constructed from the \[attributes\],
+    /// \[children\], and descendants of E". The lookup is then restricted to
+    /// that subtree *before* the first claimant is chosen, so an element
+    /// outside it is never returned and never hides one inside it.
     fn find_element_by_id(&self, id: &str) -> Result<Option<Self>, NavigatorError> {
-        let found = self
-            .doc
-            .get_element_by_id_in_tree(self.current, id)
-            .filter(|&r| {
-                self.orphan_root == NULL
-                    || (r >= self.orphan_root && r < self.doc.subtree_end(self.orphan_root))
-            });
+        let scope_root = if self.orphan_root != NULL {
+            self.orphan_root
+        } else {
+            self.assertion_fragment_root
+        };
+        let found = if scope_root != NULL {
+            self.doc.element_by_id_in_subtree(scope_root, id)
+        } else {
+            self.doc.get_element_by_id_in_tree(self.current, id)
+        };
         Ok(found.map(|r| {
             let mut nav = BufferDocNavigator::new(self.doc, r);
             nav.assertion_absolute_root = self.assertion_absolute_root;
@@ -2503,5 +2540,218 @@ mod tests {
             !cursor.move_to_parent(),
             "move_to must carry the cut upward link"
         );
+    }
+
+    // ── 16. The scope of fn:id under new_assertion / new_orphan ──────
+
+    /// Builds `<outer><sib xml:id=SIB/><inner>[<leaf xml:id=LEAF/>]</inner></outer>`
+    /// in a `Fragment` buffer, as the validator's assertion builder does, and
+    /// returns the document with the `inner` element.
+    fn assertion_fragment<'a>(
+        arena: &'a Bump,
+        names: &'a NameTable,
+        sib: Option<&str>,
+        leaf: Option<&str>,
+    ) -> (&'a BufferDocument<'a>, u32) {
+        use crate::namespace::table::XML_NAMESPACE;
+        let mut builder = crate::document::BufferDocumentBuilder::new(
+            arena,
+            names,
+            None,
+            crate::document::BufferDocumentOptions::fragment(),
+        )
+        .unwrap();
+        builder.start_element("outer", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.start_element("sib", "", "", &[]).unwrap();
+        if let Some(id) = sib {
+            builder.attribute("id", XML_NAMESPACE, "xml", id).unwrap();
+        }
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let inner = builder.start_element("inner", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        if let Some(id) = leaf {
+            builder.start_element("leaf", "", "", &[]).unwrap();
+            builder.attribute("id", XML_NAMESPACE, "xml", id).unwrap();
+            builder.end_of_attributes();
+            builder.end_element().unwrap();
+        }
+        builder.end_element().unwrap();
+        builder.end_element().unwrap();
+        (arena.alloc(builder.finalize().unwrap()), inner)
+    }
+
+    /// XSD 1.1 §3.13.4.1 clause 1.3: the assertion's data model instance
+    /// "contains only that node and nodes constructed from the \[attributes\],
+    /// \[children\], and descendants of E" — so `fn:id` inside an assertion
+    /// must not find an element outside the asserted element, here its
+    /// preceding sibling.
+    #[test]
+    fn id_in_an_assertion_does_not_reach_outside_the_asserted_element() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let (doc, inner) = assertion_fragment(&arena, &names, Some("x"), None);
+        let result = eval(
+            &names,
+            BufferDocNavigator::new_assertion(doc, inner),
+            "empty(id('x'))",
+        )
+        .expect("evaluates");
+        assert_eq!(result.as_bool(), Some(true), "the sibling is outside E");
+        assert!(BufferDocNavigator::new_assertion(doc, inner)
+            .find_element_by_id("x")
+            .unwrap()
+            .is_none());
+        // The same lookup from the outer element, whose subtree holds `sib`.
+        let outer = doc.root() + 1;
+        let found = BufferDocNavigator::new_assertion(doc, outer)
+            .find_element_by_id("x")
+            .unwrap()
+            .expect("inside the outer element");
+        assert_eq!(found.local_name(), "sib");
+    }
+
+    /// An element inside the asserted element is found, even when an element
+    /// outside it — earlier in document order — claims the same value: the
+    /// restricted lookup answers with the first claimant *inside* the subtree,
+    /// not with the first claimant of the buffer filtered afterwards.
+    #[test]
+    fn id_in_an_assertion_finds_the_first_claimant_inside_the_asserted_element() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let (doc, inner) = assertion_fragment(&arena, &names, Some("k"), Some("k"));
+        let found = BufferDocNavigator::new_assertion(doc, inner)
+            .find_element_by_id("k")
+            .unwrap()
+            .expect("the leaf inside E claims k");
+        assert_eq!(found.local_name(), "leaf");
+        let result = eval(
+            &names,
+            BufferDocNavigator::new_assertion(doc, inner),
+            "string(name(id('k')))",
+        )
+        .expect("evaluates");
+        assert_eq!(result.as_str().as_deref(), Some("leaf"));
+    }
+
+    /// The same for a parentless node: the orphan's own tree holds `inside`,
+    /// and an earlier `outside` with the same id must not hide it.
+    #[test]
+    fn an_orphan_finds_the_first_claimant_inside_its_own_tree() {
+        use crate::namespace::table::XML_NAMESPACE;
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = crate::document::BufferDocumentBuilder::new(
+            &arena,
+            &names,
+            None,
+            crate::document::BufferDocumentOptions::default(),
+        )
+        .unwrap();
+        builder.start_element("holder", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.start_element("outside", "", "", &[]).unwrap();
+        builder.attribute("id", XML_NAMESPACE, "xml", "k").unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let kid = builder.start_element("kid", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        let inside = builder.start_element("inside", "", "", &[]).unwrap();
+        builder.attribute("id", XML_NAMESPACE, "xml", "k").unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        builder.end_element().unwrap();
+        builder.end_element().unwrap();
+        let doc = builder.finalize().unwrap();
+
+        let found = BufferDocNavigator::new_orphan(&doc, kid)
+            .find_element_by_id("k")
+            .unwrap()
+            .expect("inside is in the orphan's tree");
+        assert_eq!(found.current_ref(), inside);
+        // The hit keeps the parentless view.
+        let mut up = found.clone();
+        assert!(up.move_to_parent());
+        assert_eq!(up.current_ref(), kid);
+        assert!(!up.move_to_parent(), "the orphan is still the top");
+    }
+
+    /// A parentless text, comment or attribute node holds no element, so no id
+    /// lookup from it can succeed — even though the range of nodes after an
+    /// attribute runs into its owner's children.
+    #[test]
+    fn a_parentless_attribute_finds_no_id() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(
+            r#"<holder a="1"><kid xml:id="k"/></holder>"#,
+            &arena,
+            &names,
+        );
+        let holder = doc.root() + 1;
+        let attr = holder + 1;
+        assert_eq!(doc.nodes.get(attr).node_type(), NodeType::Attribute);
+        assert!(BufferDocNavigator::new_orphan(&doc, attr)
+            .find_element_by_id("k")
+            .unwrap()
+            .is_none());
+    }
+
+    /// `new_orphan` on the document node: the document node has no parent and
+    /// no siblings already, so the parentless view is the ordinary one and
+    /// must not hide the document's children.
+    #[test]
+    fn new_orphan_on_the_document_node_is_the_ordinary_navigator() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc("<r><x/></r>", &arena, &names);
+        let mut nav = BufferDocNavigator::new_orphan(&doc, doc.root());
+        assert!(!nav.move_to_parent());
+        assert!(nav.move_to_first_child(), "the document element is visible");
+        assert_eq!(nav.local_name(), "r");
+        for (expr, expected) in [
+            ("count(*)", 1.0),
+            ("count(node())", 1.0),
+            ("count(descendant::x)", 1.0),
+            ("count(/r)", 1.0),
+            ("count(root()/r/x)", 1.0),
+        ] {
+            let result = eval(
+                &names,
+                BufferDocNavigator::new_orphan(&doc, doc.root()),
+                expr,
+            )
+            .expect("evaluates");
+            assert_eq!(result.as_f64(), Some(expected), "{expr}");
+        }
+    }
+
+    /// A reference that is not a node of the document is a caller error,
+    /// reported at once rather than on first use.
+    #[test]
+    #[should_panic(expected = "not a node of this document")]
+    fn new_orphan_panics_on_a_node_reference_out_of_range() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc("<r/>", &arena, &names);
+        let _ = BufferDocNavigator::new_orphan(&doc, doc.nodes.len());
+    }
+
+    /// In a `Full` document the whole document is one tree, so a cursor on a
+    /// top-level comment finds the ids of the document element.
+    #[test]
+    fn find_element_by_id_from_a_top_level_comment() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(r#"<!--c--><?pi x?><r><a xml:id="x"/></r>"#, &arena, &names);
+        let mut nav = doc.create_navigator();
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.node_type(), DomNodeType::Comment);
+        let found = nav
+            .find_element_by_id("x")
+            .unwrap()
+            .expect("same document, same tree");
+        assert_eq!(found.local_name(), "a");
     }
 }

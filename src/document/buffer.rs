@@ -11,7 +11,7 @@ use crate::schema::SchemaSet;
 
 use super::{
     BindingRemapTable, BufferDocumentOptions, DocumentKind, ElementIndex, NamespacePageFactory,
-    Node, NodePages, NodeSourceSpans, NsRef, QNameTable, StringStore, NULL,
+    Node, NodePages, NodeSourceSpans, NodeType, NsRef, QNameTable, StringStore, NULL,
 };
 
 /// Monotonic source of [`BufferDocument::serial`] values.
@@ -95,7 +95,9 @@ pub(crate) fn id_index_key(value: &str) -> Option<Cow<'_, str>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IdClaim {
     /// The root of the tree `elem` belongs to (see
-    /// [`BufferDocument::tree_root_of`]).
+    /// [`BufferDocument::tree_root_of`]): the document node in a
+    /// [`DocumentKind::Full`] document, the top-level node `elem` descends
+    /// from in a [`DocumentKind::Fragment`] buffer.
     pub(crate) tree: u32,
     pub(crate) elem: u32,
     pub(crate) attr: u32,
@@ -103,8 +105,8 @@ pub(crate) struct IdClaim {
 
 /// Every claim on one id value.
 ///
-/// The scope of an id is one *tree*, and one buffer can hold several top-level
-/// trees, so a lookup is by `(tree, value)`. The tree is kept here, beside the
+/// The scope of an id is one *tree*, and a [`DocumentKind::Fragment`] buffer
+/// can hold several top-level trees, so a lookup is by `(tree, value)`. The tree is kept here, beside the
 /// element, rather than inside the map key, so that a lookup can borrow a
 /// `&str` straight into the map and never allocate.
 ///
@@ -141,6 +143,17 @@ impl IdSlot {
                 .map(|claim| claim.elem)
                 .min(),
         }
+    }
+
+    /// The first element in document order among the claimants that lie in
+    /// the node range `[start, end)` — a subtree, for
+    /// [`BufferDocument::element_by_id_in_subtree`].
+    pub(crate) fn in_range(&self, start: u32, end: u32) -> Option<u32> {
+        self.claims()
+            .iter()
+            .map(|claim| claim.elem)
+            .filter(|&elem| elem >= start && elem < end)
+            .min()
     }
 
     /// The first element in document order, across every tree of the buffer.
@@ -509,14 +522,33 @@ impl<'a> BufferDocument<'a> {
         }
     }
 
-    /// The root of the tree `node` belongs to.
+    /// The root of the tree `node` belongs to — the node the id index files a
+    /// claim under. `node` must be a node of this document.
     ///
-    /// That is the topmost ancestor below the document node — the node the id
-    /// index is keyed by. A node whose upward link has been cut (the document
-    /// node itself, or an element
-    /// [`set_cta_fragment`](Self::set_cta_fragment) has re-rooted) is its own
-    /// tree root.
+    /// The rule follows what the navigator presents:
+    ///
+    /// * In a [`DocumentKind::Full`] document the whole document is **one
+    ///   tree**: the navigator shows every top-level node — elements, comments,
+    ///   processing instructions — under the one document node, and `fn:root()`
+    ///   reaches it from all of them. The tree root is the document node.
+    /// * In a [`DocumentKind::Fragment`] buffer the document node is only the
+    ///   holder of nodes that are handed out as parentless
+    ///   ([`BufferDocNavigator::new_orphan`],
+    ///   [`BufferDocNavigator::new_assertion`]), so **each child of the
+    ///   document node is the root of a tree of its own**, and the document
+    ///   node is its own tree root. An element
+    ///   [`set_cta_fragment`](Self::set_cta_fragment) has re-rooted (its upward
+    ///   link is cut) is a tree root too.
+    ///
+    /// [`BufferDocNavigator::new_orphan`]: super::navigator::BufferDocNavigator::new_orphan
+    /// [`BufferDocNavigator::new_assertion`]: super::navigator::BufferDocNavigator::new_assertion
     pub(crate) fn tree_root_of(&self, node: u32) -> u32 {
+        if self.kind == DocumentKind::Full {
+            // Nothing re-roots a `Full` document — `set_cta_fragment` turns
+            // the document into a `Fragment` — so every node descends from the
+            // document node.
+            return DOCUMENT_NODE;
+        }
         let mut cursor = node;
         loop {
             let parent = self.nodes.get(cursor).parent;
@@ -527,6 +559,12 @@ impl<'a> BufferDocument<'a> {
         }
     }
 
+    /// Whether `node_ref` is a node of this document.
+    #[inline]
+    pub(crate) fn has_node(&self, node_ref: u32) -> bool {
+        node_ref < self.nodes.len()
+    }
+
     /// Looks up an element node by its id: the value of its `xml:id`, or of an
     /// attribute whose typed value is a single `xs:ID`.
     ///
@@ -534,23 +572,46 @@ impl<'a> BufferDocument<'a> {
     /// is stripped at both ends and collapsed inside, and a value that is not
     /// a lexical NCName never matches.
     ///
-    /// A buffer can hold more than one tree, and the scope of an id is one
-    /// tree; this looks across all of them and answers with the element that
-    /// comes **first in document order**. Use
-    /// [`get_element_by_id_in_tree`](Self::get_element_by_id_in_tree) to stay
-    /// inside one tree, which is what `fn:id` needs.
+    /// When several elements answer to the value, the one that comes **first
+    /// in document order** is returned. A [`DocumentKind::Full`] document is
+    /// one tree; a [`DocumentKind::Fragment`] buffer can hold several (see
+    /// [`get_element_by_id_in_tree`](Self::get_element_by_id_in_tree)), and
+    /// this looks across all of them. Use `get_element_by_id_in_tree` to stay
+    /// inside one tree.
     pub fn get_element_by_id(&self, id: &str) -> Option<u32> {
         let key = id_index_key(id)?;
         self.id_elements.get(key.as_ref()).map(IdSlot::first)
     }
 
-    /// Looks up an element node by its id **within one tree**.
+    /// Looks up an element node by its id **within one tree**, answering with
+    /// the first such element in document order.
     ///
     /// `node` is any node of the wanted tree — the tree root is resolved from
-    /// it — so a caller can pass the node it already holds. Passing the
-    /// document node means "every tree of this buffer", and then this is
-    /// [`get_element_by_id`](Self::get_element_by_id).
+    /// it — so a caller can pass the node it already holds. Which nodes make up
+    /// one tree depends on the [`DocumentKind`]:
+    ///
+    /// * In a [`DocumentKind::Full`] document the whole document is one tree,
+    ///   as the navigator presents it — every top-level node, a comment or
+    ///   processing instruction before the document element included, sits
+    ///   under the one document node. Any node of the document finds every id
+    ///   of the document, exactly as
+    ///   [`get_element_by_id`](Self::get_element_by_id) does.
+    /// * In a [`DocumentKind::Fragment`] buffer the document node only holds
+    ///   nodes that are handed out as parentless (see
+    ///   [`BufferDocNavigator::new_orphan`]): each child of the document node
+    ///   is the root of its own tree, and `node` finds only the ids of the
+    ///   top-level tree it belongs to. A top-level comment, processing
+    ///   instruction or text node is a tree that holds no element.
+    ///
+    /// Passing the document node means "every tree of this buffer", and then
+    /// this is [`get_element_by_id`](Self::get_element_by_id). A `node` that is
+    /// not a node of this document answers `None`.
+    ///
+    /// [`BufferDocNavigator::new_orphan`]: super::navigator::BufferDocNavigator::new_orphan
     pub fn get_element_by_id_in_tree(&self, node: u32, id: &str) -> Option<u32> {
+        if !self.has_node(node) {
+            return None;
+        }
         let key = id_index_key(id)?;
         let slot = self.id_elements.get(key.as_ref())?;
         let tree = self.tree_root_of(node);
@@ -559,6 +620,35 @@ impl<'a> BufferDocument<'a> {
         } else {
             slot.in_tree(tree)
         }
+    }
+
+    /// The first element in document order that answers to `id` **inside the
+    /// subtree rooted at `root`**, `root` itself included.
+    ///
+    /// This is the lookup for a navigator that presents `root` as the top of
+    /// the visible tree ([`BufferDocNavigator::new_orphan`],
+    /// [`BufferDocNavigator::new_assertion`]): the scope of an id is then that
+    /// subtree, not the physical tree that holds it, and an element outside
+    /// the subtree must neither be returned nor hide a claimant inside it —
+    /// so the range is applied to the claims, before the first one is chosen.
+    /// A `root` that is not an element or document node holds no element, and
+    /// one that is not a node of this document finds nothing.
+    ///
+    /// [`BufferDocNavigator::new_orphan`]: super::navigator::BufferDocNavigator::new_orphan
+    /// [`BufferDocNavigator::new_assertion`]: super::navigator::BufferDocNavigator::new_assertion
+    pub(crate) fn element_by_id_in_subtree(&self, root: u32, id: &str) -> Option<u32> {
+        if !self.has_node(root) {
+            return None;
+        }
+        if !matches!(
+            self.nodes.get(root).node_type(),
+            NodeType::Element | NodeType::Root
+        ) {
+            return None;
+        }
+        let key = id_index_key(id)?;
+        let slot = self.id_elements.get(key.as_ref())?;
+        slot.in_range(root, self.subtree_end(root))
     }
 
     // ── CTA fragment configuration ─────────────────────────────────────

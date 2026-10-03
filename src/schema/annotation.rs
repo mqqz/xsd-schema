@@ -37,7 +37,7 @@ impl XmlFragment {
 /// Foreign attribute - a non-XSD attribute on a schema element
 ///
 /// XSD allows arbitrary attributes from non-XSD namespaces on most elements.
-/// These are collected for extensibility (e.g., XSLT stylesheets, JAXB bindings).
+/// These are collected for extensibility (e.g., tool-specific annotations such as JAXB bindings).
 #[derive(Debug, Clone)]
 pub struct ForeignAttribute {
     /// Qualified name of the attribute

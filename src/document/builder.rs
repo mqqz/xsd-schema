@@ -306,7 +306,10 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// through this API alike. The cost is two integer comparisons per
     /// attribute (the name is interned either way). An attribute that is an id
     /// by its *type* rather than its name is filed when its annotation is
-    /// attached, by [`set_node_binding`](Self::set_node_binding).
+    /// attached, by [`set_node_binding`](Self::set_node_binding). Only an
+    /// attribute of an element makes an id: one added while no element is
+    /// open belongs to the document node and is not filed, because `fn:id`
+    /// selects elements only.
     ///
     /// The builder does not look for an attribute of the same name already on
     /// the element: calling this twice with one name makes two attribute nodes.
@@ -388,10 +391,10 @@ impl<'a> BufferDocumentBuilder<'a> {
         }
 
         if is_xml_id {
-            if let Some(key) = id_index_key(value) {
+            if let (Some(owner), Some(key)) = (self.id_owner(attr_ref), id_index_key(value)) {
                 let claim = IdClaim {
-                    tree: self.tree_of(self.parent),
-                    elem: self.parent,
+                    tree: self.tree_of(owner),
+                    elem: owner,
                     attr: attr_ref,
                 };
                 if file_id_claim(&mut self.doc.id_elements, &key, claim) {
@@ -610,14 +613,33 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// registered here stays registered: no attribute stands behind it, so
     /// replacing an attribute of the element never withdraws it.
     ///
+    /// Which elements share a tree depends on the document kind: a
+    /// [`DocumentKind::Full`] document is one tree (every top-level node sits
+    /// under the one document node), while in a [`DocumentKind::Fragment`]
+    /// buffer each child of the document node is the root of its own tree —
+    /// see [`BufferDocument::get_element_by_id_in_tree`].
+    ///
     /// The value is normalized as an index key (XML whitespace stripped and
     /// collapsed); a value that is not a lexical NCName is ignored, because
-    /// such a node can never be selected.
+    /// such a node can never be selected. So is a node that is not an element:
+    /// `fn:id` selects elements only.
     ///
     /// Returns [`BufferDocumentError::DuplicateId`] if another element of the
-    /// **same tree** already answers to this id. Registering the same element
-    /// twice is accepted and changes nothing.
+    /// **same tree** already answers to the normalized value. Registering the
+    /// same element twice is accepted and changes nothing: a duplicate is a
+    /// second *element* with the value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `elem_ref` is not a node of the document being built.
     pub fn register_xml_id(&mut self, id: &str, elem_ref: u32) -> Result<(), BufferDocumentError> {
+        assert!(
+            self.doc.has_node(elem_ref),
+            "register_xml_id: {elem_ref} is not a node of this document"
+        );
+        if self.doc.nodes.get(elem_ref).node_type() != NodeType::Element {
+            return Ok(());
+        }
         let Some(key) = id_index_key(id) else {
             return Ok(());
         };
@@ -876,8 +898,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         });
 
         if is_xml_id {
-            if let Some(key) = id_index_key(value) {
-                let owner = self.doc.nodes.get(attr_ref).parent;
+            if let (Some(owner), Some(key)) = (self.id_owner(attr_ref), id_index_key(value)) {
                 let claim = IdClaim {
                     tree: self.tree_of(owner),
                     elem: owner,
@@ -899,14 +920,28 @@ impl<'a> BufferDocumentBuilder<'a> {
         atom.namespace_uri == self.xml_id_name.1 && atom.local_name == self.xml_id_name.0
     }
 
-    /// The root of the tree `elem` belongs to — for an element that is open,
-    /// the outermost open element, which costs no parent walk.
+    /// The root of the tree `elem` belongs to (see
+    /// [`BufferDocument::tree_root_of`]) — in a `Fragment` buffer, for the
+    /// element that is open, the outermost open element, which costs no parent
+    /// walk.
     #[inline]
     fn tree_of(&self, elem: u32) -> u32 {
         match self.element_stack.first() {
-            Some(outermost) if elem == self.parent => outermost.node_ref,
+            Some(outermost) if elem == self.parent && self.doc.kind == DocumentKind::Fragment => {
+                outermost.node_ref
+            }
             _ => self.doc.tree_root_of(elem),
         }
+    }
+
+    /// The element the attribute `attr_ref` belongs to, or `None` when it was
+    /// added while no element was open and so belongs to the document node.
+    /// Only an element can answer to an id (`fn:id` returns `element()*`), so
+    /// such an attribute files nothing.
+    #[inline]
+    fn id_owner(&self, attr_ref: u32) -> Option<u32> {
+        let owner = self.doc.nodes.get(attr_ref).parent;
+        (self.doc.nodes.get(owner).node_type() == NodeType::Element).then_some(owner)
     }
 
     /// The is-id class of the binding at `binding_idx`, computed once per
@@ -944,7 +979,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         }
         let type_key = self.doc.binding_remap.get(binding_idx)?.type_key;
         let schema_set = self.doc.schema_set?;
-        let owner = self.doc.nodes.get(attr_ref).parent;
+        let owner = self.id_owner(attr_ref)?;
         let claim = IdClaim {
             tree: self.tree_of(owner),
             elem: owner,
@@ -2442,6 +2477,177 @@ mod tests {
         let doc = builder.finalize().unwrap();
         assert_eq!(doc.get_element_by_id("k"), Some(a));
         assert_eq!(doc.get_element_by_id("1abc"), None);
+    }
+
+    // ── Which nodes make up one tree ──────────────────────────────────
+
+    /// In a `Full` document the whole document is one tree: the navigator
+    /// presents every top-level node under the one document node. A second
+    /// top-level element registering an id the first already has is a
+    /// duplicate, and a lookup anchored on either answers with the first in
+    /// document order.
+    #[test]
+    fn a_full_document_with_two_top_level_elements_is_one_tree() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder(&arena, &names);
+        let top = |builder: &mut BufferDocumentBuilder<'_>, name: &str, id: &str| {
+            let elem = builder.start_element(name, "", "", &[]).unwrap();
+            builder.attribute("id", XML_NAMESPACE, "xml", id).unwrap();
+            builder.end_of_attributes();
+            builder.end_element().unwrap();
+            elem
+        };
+        let a = top(&mut builder, "a", "shared");
+        let c = top(&mut builder, "c", "shared");
+        builder.start_element("e", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        let e = builder.parent;
+        builder.end_element().unwrap();
+
+        builder.register_xml_id("k", a).unwrap();
+        assert!(
+            matches!(
+                builder.register_xml_id("k", e),
+                Err(BufferDocumentError::DuplicateId(_))
+            ),
+            "one document, one tree"
+        );
+
+        let doc = builder.finalize().unwrap();
+        assert_eq!(doc.get_element_by_id_in_tree(c, "shared"), Some(a));
+        assert_eq!(doc.get_element_by_id_in_tree(a, "shared"), Some(a));
+        assert_eq!(doc.get_element_by_id_in_tree(e, "k"), Some(a));
+    }
+
+    /// Text parsing reports a duplicate across two top-level elements of a
+    /// `Full` document as well.
+    #[test]
+    fn a_full_document_reports_a_duplicate_across_top_level_elements() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder(&arena, &names);
+        builder.start_element("a", "", "", &[]).unwrap();
+        builder.attribute("id", XML_NAMESPACE, "xml", "d").unwrap();
+        assert_eq!(builder.dropped_duplicate_id(), None);
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        builder.start_element("b", "", "", &[]).unwrap();
+        builder.attribute("id", XML_NAMESPACE, "xml", "d").unwrap();
+        assert_eq!(builder.dropped_duplicate_id().as_deref(), Some("d"));
+    }
+
+    /// A top-level comment or processing instruction of a `Full` document is
+    /// in the document's one tree, so a lookup anchored on it finds the
+    /// document element's ids. In a `Fragment` buffer each top-level node is
+    /// a tree of its own, and a comment's tree holds no element.
+    #[test]
+    fn a_top_level_comment_is_in_the_tree_of_a_full_document() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        for (options, expected) in [
+            (BufferDocumentOptions::default(), true),
+            (BufferDocumentOptions::fragment(), false),
+        ] {
+            let mut builder = BufferDocumentBuilder::new(&arena, &names, None, options).unwrap();
+            builder.comment("c").unwrap();
+            let r = builder.start_element("r", "", "", &[]).unwrap();
+            builder.end_of_attributes();
+            let a = builder.start_element("a", "", "", &[]).unwrap();
+            builder.attribute("id", XML_NAMESPACE, "xml", "x").unwrap();
+            builder.end_of_attributes();
+            builder.end_element().unwrap();
+            builder.end_element().unwrap();
+            let doc = builder.finalize().unwrap();
+            let comment = doc.first_content_child_of(doc.root()).unwrap();
+            assert_eq!(doc.nodes.get(comment).node_type(), NodeType::Comment);
+            assert_ne!(comment, r);
+            assert_eq!(
+                doc.get_element_by_id_in_tree(comment, "x"),
+                expected.then_some(a),
+                "{:?}",
+                options.kind
+            );
+            assert_eq!(doc.get_element_by_id_in_tree(doc.root(), "x"), Some(a));
+        }
+    }
+
+    /// Only an attribute owned by an element can make an id: an `xml:id`
+    /// added while no element is open belongs to the document node, and
+    /// `fn:id` returns elements only.
+    #[test]
+    fn an_xml_id_with_no_open_element_is_not_filed() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder(&arena, &names);
+        builder.attribute("id", XML_NAMESPACE, "xml", "zz").unwrap();
+        builder.start_element("r", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let doc = builder.finalize().unwrap();
+        assert_eq!(doc.get_element_by_id("zz"), None);
+        assert_eq!(doc.get_element_by_id_in_tree(doc.root(), "zz"), None);
+
+        let ctx = crate::xpath::context::XPathContext::new(&names);
+        let result = crate::xpath::XPathExpr::compile("count(id('zz'))", &ctx)
+            .unwrap()
+            .evaluator(&ctx)
+            .run_with_node(doc.create_navigator())
+            .unwrap();
+        assert_eq!(result.as_f64(), Some(0.0));
+    }
+
+    /// A lookup anchored on a reference that is not a node of the document
+    /// answers `None` rather than panicking — also for a reference past the
+    /// end that still falls inside the last allocated page.
+    #[test]
+    fn get_element_by_id_in_tree_with_a_bad_node_reference_is_none() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder(&arena, &names);
+        builder.start_element("r", "", "", &[]).unwrap();
+        builder.attribute("id", XML_NAMESPACE, "xml", "q").unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let doc = builder.finalize().unwrap();
+        assert_eq!(doc.get_element_by_id_in_tree(1_000_000, "q"), None);
+        assert_eq!(doc.get_element_by_id_in_tree(doc.nodes.len(), "q"), None);
+        assert_eq!(doc.get_element_by_id_in_tree(NULL, "q"), None);
+        assert_eq!(doc.get_element_by_id_in_tree(doc.root(), "q"), Some(1));
+    }
+
+    /// `register_xml_id` with a reference that is not a node of the document
+    /// being built is a caller error and panics, as documented.
+    #[test]
+    #[should_panic(expected = "not a node of this document")]
+    fn register_xml_id_panics_on_a_node_reference_out_of_range() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder(&arena, &names);
+        builder.start_element("r", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let _ = builder.register_xml_id("q", 1_000_000);
+    }
+
+    /// `register_xml_id` on a node that is not an element files nothing:
+    /// only an element has an id.
+    #[test]
+    fn register_xml_id_on_a_non_element_is_ignored() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder(&arena, &names);
+        builder.start_element("r", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.text("t");
+        builder.end_element().unwrap();
+        builder.register_xml_id("doc", 0).unwrap();
+        let text = 2;
+        assert_eq!(builder.doc.nodes.get(text).node_type(), NodeType::Text);
+        builder.register_xml_id("txt", text).unwrap();
+        let doc = builder.finalize().unwrap();
+        assert_eq!(doc.get_element_by_id("doc"), None);
+        assert_eq!(doc.get_element_by_id("txt"), None);
     }
 }
 

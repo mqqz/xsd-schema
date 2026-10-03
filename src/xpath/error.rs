@@ -677,6 +677,7 @@ pub const QNAMED_ERROR_CODES: &[&str] = &[
 /// Produced by [`XPathError::raised_error`]. `namespace_uri` is empty when the
 /// error QName is in no namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RaisedError<'a> {
     /// Namespace URI of the error QName ("" for no namespace).
     pub namespace_uri: &'a str,
