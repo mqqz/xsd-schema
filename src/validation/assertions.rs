@@ -43,6 +43,13 @@ pub(crate) struct AssertionBufferFrame {
     pub element_path: String,
     /// Source location at the time this frame's element closed.
     pub location: Option<SourceLocation>,
+    /// Whether a failure of this (deferred, nested) frame makes the outermost
+    /// asserted element invalid. Populated at deferral: `true` when every
+    /// element from this frame's parent up to and including the outermost
+    /// asserted element was strictly assessed, so `[validity]` = invalid
+    /// travels up the chain (Structures §3.3.5.1 `[validity]` clause 1.1.2); a
+    /// laxly assessed element in between is `notKnown` (clause 2) and stops it.
+    pub propagates_to_outer: bool,
 }
 
 // ---------------------------------------------------------------------------

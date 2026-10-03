@@ -101,6 +101,17 @@ enum AttributeOwnerType {
     NotAllowed(SchemaInfo),
 }
 
+/// A keyref whose referenced key/unique table was not in scope when the
+/// keyref's element closed; retried as its ancestors close.
+struct DeferredKeyref {
+    table: KeyTable,
+    refer_key: Option<IdentityConstraintKey>,
+    /// Serials of the elements a failure would still invalidate: the keyref's
+    /// own element and the run of strictly assessed ancestors above it, as of
+    /// the deferral (see `ValidationRuntime::invalidity_reach`).
+    reach: Vec<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // XsiTypeOutcome — three-state result from resolve_xsi_type
 // ---------------------------------------------------------------------------
@@ -179,7 +190,15 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     ic_scope_tables: Vec<Option<HashMap<IdentityConstraintKey, KeyTable>>>,
     /// Keyrefs whose refer target was not yet available when they deactivated.
     /// Carried upward and retried after each scope propagation.
-    deferred_keyrefs: Vec<(KeyTable, Option<IdentityConstraintKey>)>,
+    deferred_keyrefs: Vec<DeferredKeyref>,
+    /// A duplicate ID (cvc-id.2) was reported since the current validation
+    /// root opened; the root is then invalid (§3.3.4.3 clause 7, §3.3.4.5
+    /// clause 2). Applied and cleared when the root closes.
+    root_id_conflict: bool,
+    /// Index into `pending_idrefs` of the first IDREF recorded since the
+    /// current validation root opened: those must resolve for the root to be
+    /// valid (§3.3.4.5 clause 1). Advanced when the root closes.
+    root_idref_start: usize,
     /// Which assertion evaluation path is active (XSD 1.1 only)
     #[cfg(feature = "xsd11")]
     pub(crate) assertion_source: AssertionSource,
@@ -374,6 +393,19 @@ struct DeclaredElementBinding {
     has_type_alternatives: bool,
 }
 
+/// Record that an element's `[validity]` is invalid because of something other
+/// than its own local checks — an invalid child (Structures §3.3.5.1
+/// `[validity]` clause 1.1.2), a violated identity constraint it carries
+/// (§3.3.4.3 clause 6), or, for the validation root, an ID/IDREF violation
+/// (§3.3.4.3 clause 7, §3.3.4.5). Only a `valid` verdict turns `invalid`: an
+/// element that was not strictly assessed is `notKnown` whatever its children
+/// (§3.3.5.1 clause 2), and an `invalid` one stays so.
+fn invalidate(validity: &mut SchemaValidity) {
+    if *validity == SchemaValidity::Valid {
+        *validity = SchemaValidity::Invalid;
+    }
+}
+
 /// Element-start step 9: initialize the freshly acquired child state for a
 /// declared element. The caller has already seeded the state's namespace
 /// context and content model; this sets the governing binding, the nil flag,
@@ -422,8 +454,12 @@ impl DeclaredElementBinding {
     /// attribute." An `xsi:nil` on a non-nillable declaration satisfies
     /// neither clause 3.1 nor clause 3.2, so E is not locally valid and its
     /// `[validity]` is `invalid` from the start event onward.
+    ///
+    /// So is `is_abstract` (cvc-elt.2): the same rule's "2 D.{abstract} =
+    /// false."
     fn state_validity(&self, edc_invalid: bool) -> SchemaValidity {
         if self.xsi_type_invalid
+            || self.is_abstract
             || self.abstract_type_invalid
             || self.nillable_violation
             || self.has_deferred_type_error
@@ -671,6 +707,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             unparsed_entities: None,
             ic_scope_tables: Vec::new(),
             deferred_keyrefs: Vec::new(),
+            root_id_conflict: false,
+            root_idref_start: 0,
             final_ic_tables: None,
             schema_location_hints: Vec::new(),
             no_namespace_schema_location_hints: Vec::new(),
@@ -983,6 +1021,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 complex_type_key: ct_key,
                 element_path: String::new(), // populated at end-element
                 location: None,              // populated at end-element
+                propagates_to_outer: false,  // populated at deferral
             });
             if let Some(ev) = self.validation_stack.last_mut() {
                 ev.owns_assertion_buffer = true;
@@ -1058,6 +1097,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             complex_type_key: new_ct_key,
             element_path: String::new(),
             location: None,
+            propagates_to_outer: false,
         });
         if let Some(ev) = self.validation_stack.last_mut() {
             ev.owns_assertion_buffer = true;
@@ -1101,10 +1141,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// Report assertion errors for deferred (nested) frames using their stored
     /// path and location instead of the current runtime state.
     ///
-    /// Note: deferred errors are reported to the sink but do **not** affect the
-    /// outer (current) element's `SchemaValidity`. This is intentional per XSD
-    /// 1.1 §3.13.4.1: each element's validity is determined by its own type's
-    /// assertions, not by those of descendant elements.
+    /// Reporting only: a nested element's assertions do not bear on the outer
+    /// element's *local* validity (§3.13.4.1 — each element is checked against
+    /// its own type's assertions), but its `[validity]` does reach the outer
+    /// element through §3.3.5.1 clause 1.1.2; the caller applies that, gated by
+    /// [`AssertionBufferFrame::propagates_to_outer`].
     #[cfg(feature = "xsd11")]
     fn report_assertion_errors_deferred(
         &mut self,
@@ -1124,6 +1165,41 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             };
             self.sink.on_error(err);
         }
+    }
+
+    /// Called when a nested asserted element closes and its frame is deferred
+    /// (its own element already popped): whether a failure of that frame,
+    /// known only when the outermost asserted element closes, still makes the
+    /// outermost one invalid. It does when every open element from the
+    /// outermost asserted one to the top of the stack — the nested element's
+    /// ancestors in between — was strictly assessed: `[validity]` = invalid
+    /// passes from child to parent only through strictly assessed elements
+    /// (§3.3.5.1 clause 1.1.2); a laxly assessed one is `notKnown` (clause 2)
+    /// whatever its children.
+    ///
+    /// The outermost asserted element owns the bottom frame of
+    /// `assertion_buffer_stack`; counting frame owners down from the top of the
+    /// validation stack finds it (an owner left over from an aborted buffer
+    /// sits further down and is not counted).
+    #[cfg(feature = "xsd11")]
+    fn nested_failure_reaches_outer(&self) -> bool {
+        let live_frames = self.assertion_buffer_stack.len();
+        if live_frames == 0 {
+            return false;
+        }
+        let mut owners = 0;
+        for ev in self.validation_stack.iter().rev() {
+            if !ev.strictly_assessed {
+                return false;
+            }
+            if ev.owns_assertion_buffer {
+                owners += 1;
+                if owners == live_frames {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     // -----------------------------------------------------------------------
@@ -1568,6 +1644,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             return ParentAdvanceOutcome::Settled(ElementStartOutcome::Invalid);
         }
         if let Some(msg) = nil_error {
+            // The nilled *parent* (still the stack top) has an element child:
+            // §3.3.4.3 clause 3.2.3.1, "E has no character or element
+            // information item [children]".
+            self.invalidate_current();
             self.report_error("cvc-elt.3.2.1", msg);
         }
         if let Some(msg) = content_model_error {
@@ -2238,6 +2318,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // Validate xsi:* built-in attributes with proper type information
         if namespace == Some(well_known::XSI_NAMESPACE) {
             let result = self.validate_xsi_attribute_on_element(local_name, namespace, value);
+            self.fold_attribute_validity(&result);
             #[cfg(feature = "xsd11")]
             self.bind_fragment_attribute(fragment_attr_ref, &result);
             return result;
@@ -2299,14 +2380,42 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             value,
         ) {
             AttributeOwnerType::Complex(ct_key) => ct_key,
-            AttributeOwnerType::NotAllowed(result) => return result,
+            AttributeOwnerType::NotAllowed(result) => {
+                self.fold_attribute_validity(&result);
+                return result;
+            }
         };
 
         self.current_state = ValidatorState::Attribute;
         let result = self.validate_attribute_on_element(ct_key, local_name, namespace, value);
+        self.fold_attribute_validity(&result);
         #[cfg(feature = "xsd11")]
         self.bind_fragment_attribute(fragment_attr_ref, &result);
         result
+    }
+
+    /// An attribute whose `[validity]` is invalid makes its element invalid:
+    /// §3.3.5.1 `[validity]` clause 1.1.2, "Neither its \[children\] nor its
+    /// \[attributes\] contains an information item … whose \[validity\] is
+    /// invalid". Most attribute checks already mark the element where they
+    /// report; this also covers those that only return an invalid
+    /// `SchemaInfo` (xsi:* values, an attribute on a simple-typed element, the
+    /// XSD 1.0 single-ID-attribute rule). A laxly assessed element is
+    /// `notKnown` (clause 2) and is left alone.
+    fn fold_attribute_validity(&mut self, attribute: &SchemaInfo) {
+        if attribute.validity == SchemaValidity::Invalid {
+            self.invalidate_attribute_owner();
+        }
+    }
+
+    /// The current element carries an invalid attribute (see
+    /// [`fold_attribute_validity`](Self::fold_attribute_validity)).
+    fn invalidate_attribute_owner(&mut self) {
+        if let Some(owner) = self.validation_stack.last_mut() {
+            if owner.strictly_assessed {
+                invalidate(&mut owner.validity);
+            }
+        }
     }
 
     /// Forward the attribute to the assertion fragment builder and return the
@@ -2851,19 +2960,23 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let mut id_defaults: Vec<(String, TypeKey)> = Vec::new();
         self.collect_absent_attribute_defaults(ct_key, &mut ic_defaults, &mut id_defaults);
         // Feed IC field matches (borrow-split: active_constraints borrows &mut self)
-        let mut multi_node_defaults: Vec<(NameId, usize)> = Vec::new();
+        let mut multi_node_defaults: Vec<(NameId, usize, usize)> = Vec::new();
         for (name, ns, value) in ic_defaults {
             for cs in &mut self.active_constraints {
                 let matches = cs.matching_fields(name, ns);
                 for field_idx in matches {
                     let already_matched = cs.set_field_value(field_idx, value.clone(), None);
                     if already_matched {
-                        multi_node_defaults.push((cs.key_table.constraint_name, field_idx));
+                        multi_node_defaults.push((
+                            cs.key_table.constraint_name,
+                            field_idx,
+                            cs.owner_depth,
+                        ));
                     }
                 }
             }
         }
-        for (constraint_name, field_idx) in multi_node_defaults {
+        for (constraint_name, field_idx, owner_depth) in multi_node_defaults {
             let cname = self
                 .schema_set
                 .name_table
@@ -2877,6 +2990,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     field_idx + 1
                 ),
             );
+            self.invalidate_open_ic_owner(owner_depth);
         }
         // Validate and collect ID/IDREF values from absent defaults.
         // Owner is the current element (attributes bind to their element).
@@ -2890,7 +3004,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 super::simple::validate_simple_type(&value, type_key, self.schema_set)
             {
                 self.collect_id_idref(&result.typed_value, &value, default_owner);
-                self.check_entity_declared(&result.typed_value);
+                if self.check_entity_declared(&result.typed_value) {
+                    self.invalidate_attribute_owner();
+                }
             }
         }
     }
@@ -3050,7 +3166,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             ev_state.has_text = true;
         }
 
-        // Report collected errors
+        // Report collected errors. Each one is a failure of the current
+        // element's own local validity — §3.4.4.2 clause 1.1 (empty content
+        // type: "E has no character or element information item [children]"),
+        // clause 1.3 (element-only: no character children "other than those
+        // whose [character code] is defined as a white space"), §3.3.4.3
+        // clause 3.2.3.1 (nilled: "E has no character or element information
+        // item [children]").
+        if !pending_errors.is_empty() {
+            self.invalidate_current();
+        }
         for (constraint, message) in pending_errors {
             self.report_error(constraint, message);
         }
@@ -3135,6 +3260,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
 
+        // Local-validity failures of the current element (as in `validate_text`).
+        if empty_violation.is_some() || nil_violation.is_some() {
+            self.invalidate_current();
+        }
         if let Some(msg) = empty_violation {
             self.report_error("cvc-complex-type.2.1", msg);
         }
@@ -3202,7 +3331,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.finish_identity_constraints(&mut ev_state);
 
         // 4. ID/IDREF/ENTITY bookkeeping
-        self.finish_id_bindings(&ev_state);
+        self.finish_id_bindings(&mut ev_state);
+
+        // 4b. Validation root closing: its ID/IDREF verdict
+        if self.validation_stack.is_empty() {
+            self.finish_validation_root_ids(&mut ev_state);
+        }
 
         #[cfg(feature = "xsd11")]
         {
@@ -3623,6 +3757,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                     pf.complex_type_key,
                                     self.schema_set,
                                 );
+                                // The nested element is invalid; so is every
+                                // strictly assessed ancestor up to this one
+                                // (§3.3.5.1 `[validity]` clause 1.1.2). Those in
+                                // between have already closed, so the verdict
+                                // lands here and travels on from here.
+                                if !errs.is_empty() && pf.propagates_to_outer {
+                                    invalidate(&mut ev_state.validity);
+                                }
                                 self.report_assertion_errors_deferred(
                                     errs,
                                     &pf.element_path,
@@ -3667,6 +3809,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     let mut deferred = frame;
                     deferred.element_path = self.element_path.clone();
                     deferred.location = self.current_location.clone();
+                    deferred.propagates_to_outer = self.nested_failure_reaches_outer();
                     self.pending_assertion_frames.push(deferred);
                     assertion_outcome = Some(AssertionOutcome::NotEvaluated);
                 }
@@ -3713,6 +3856,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             ev_state.is_nil,
             is_complex_content,
             &mut ev_state.error_codes,
+            &mut ev_state.validity,
+            ev_state.element_serial,
         );
 
         // 3b. Pop scope table and propagate key/unique tables upward to parent
@@ -3740,7 +3885,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             let scope_empty = self.ic_scope_tables.is_empty();
             let mut still_deferred = Vec::new();
             let mut deferred_errors = Vec::new();
-            for (keyref_table, refer_key) in pending {
+            // Reaches of the keyrefs that failed here: the keyref's own element
+            // has closed, so its verdict lands on the open part of its reach.
+            let mut failed_reaches: Vec<Vec<u64>> = Vec::new();
+            for deferred in pending {
+                let DeferredKeyref {
+                    table: keyref_table,
+                    refer_key,
+                    reach,
+                } = deferred;
                 let target = refer_key.and_then(|rk| {
                     self.ic_scope_tables
                         .last()
@@ -3750,6 +3903,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 match target {
                     Some(target_table) => {
                         let errs = keyref_table.check_keyref_against(target_table, name_table);
+                        if !errs.is_empty() {
+                            failed_reaches.push(reach);
+                        }
                         deferred_errors.extend(errs);
                     }
                     None => {
@@ -3780,13 +3936,21 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 ),
                                 None,
                             ));
+                            failed_reaches.push(reach);
                         } else {
-                            still_deferred.push((keyref_table, refer_key));
+                            still_deferred.push(DeferredKeyref {
+                                table: keyref_table,
+                                refer_key,
+                                reach,
+                            });
                         }
                     }
                 }
             }
             self.deferred_keyrefs = still_deferred;
+            for reach in &failed_reaches {
+                self.invalidate_late(reach, ev_state);
+            }
             // Emit deferred errors directly through the sink (not emit_error) because
             // the original keyref element has already been popped from validation_stack.
             // Using emit_error() would misattribute the error to the current ancestor.
@@ -3800,7 +3964,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     ///
     /// Collects ID/IDREF bindings from this element's typed value — owner is the
     /// parent per §3.17.5.2 — and checks that ENTITY values are declared.
-    fn finish_id_bindings(&mut self, ev_state: &ElementValidationState) {
+    fn finish_id_bindings(&mut self, ev_state: &mut ElementValidationState) {
         // 4. ID/IDREF collection from element text content.
         // Owner is the parent element per §3.17.5.2: the binding is to the
         // element that has the ID-typed child in its [children].
@@ -3812,8 +3976,35 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 .map(|e| e.element_serial)
                 .unwrap_or(ev_state.element_serial); // root: no parent, use self
             self.collect_id_idref(tv, &ev_state.text_content, parent_serial);
-            self.check_entity_declared(tv);
+            if self.check_entity_declared(tv) {
+                // The element's own content is not String Valid (§3.16.4).
+                invalidate(&mut ev_state.validity);
+            }
         }
+    }
+
+    /// F2/B1 step 4b: the ID/IDREF verdict on the validation root, applied
+    /// when the root closes (no element is left on the stack).
+    ///
+    /// Element Locally Valid (Element) (§3.3.4.3) clause 7: "If E is the
+    /// ·validation root·, then it is ·valid· per Validation Root Valid
+    /// (ID/IDREF) (§3.3.4.5)", which requires "1 There is no ID/IDREF binding
+    /// in E.\[ID/IDREF table\] whose \[binding\] is the empty set. 2 There is
+    /// no ID/IDREF binding in E.\[ID/IDREF table\] whose \[binding\] has more
+    /// than one member." A duplicate ID (cvc-id.2) is reported where it occurs; an
+    /// unresolved IDREF (cvc-id.1) is still reported by
+    /// [`end_validation`](Self::end_validation) — only the root's
+    /// `[validity]` is decided here, before the root's end event returns it.
+    fn finish_validation_root_ids(&mut self, root: &mut ElementValidationState) {
+        let start = self.root_idref_start.min(self.pending_idrefs.len());
+        let dangling_idref = self.pending_idrefs[start..]
+            .iter()
+            .any(|(idref, _, _)| !self.id_values.contains_key(idref));
+        if self.root_id_conflict || dangling_idref {
+            invalidate(&mut root.validity);
+        }
+        self.root_id_conflict = false;
+        self.root_idref_start = self.pending_idrefs.len();
     }
 
     /// F2/B1 step 5: PSVI assembly (§3.3.5.1).
@@ -3825,9 +4016,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// ([`assemble_schema_info`](Self::assemble_schema_info)) and value-free
     /// ([`validate_end_element_novalue`](Self::validate_end_element_novalue))
     /// end-element paths: pop the element path, advance the state machine,
-    /// compute `[validation attempted]` (§3.3.5.1) and propagate it to the
-    /// parent. Returns the computed `[validation attempted]` so the value path
-    /// can place it in the `SchemaInfo`.
+    /// compute `[validation attempted]` (§3.3.5.1) and propagate it — and an
+    /// invalid `[validity]` — to the parent. Returns the computed `[validation
+    /// attempted]` so the value path can place it in the `SchemaInfo`.
     fn finalize_element(&mut self, ev_state: &ElementValidationState) -> ValidationAttempted {
         // 5. Update element path
         self.pop_element_path();
@@ -3844,6 +4035,21 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             ValidationAttempted::Partial
         };
 
+        // §3.3.5.1 `[validity]`: a strictly assessed parent is valid only if
+        // "1.1.2 Neither its [children] nor its [attributes] contains an
+        // information item (element or attribute respectively) whose [validity]
+        // is invalid" and "1.1.3 … contains [no] information item … which is
+        // ·attributed· to a strict ·wildcard particle· and whose [validity] is
+        // notKnown". This child counts as invalid when it was strictly assessed
+        // and found invalid, or when it was assessed under `strict` without a
+        // governing declaration or type (an undeclared element under a strict
+        // wildcard, cvc-elt.1 — clause 1.1.3). A laxly assessed child is
+        // `notKnown` (clause 2), never invalid, even if this runtime marked it
+        // invalid for, e.g., a bad attribute.
+        let invalidates_parent = ev_state.validity == SchemaValidity::Invalid
+            && (ev_state.strictly_assessed
+                || ev_state.process_contents == ContentProcessing::Strict);
+
         // Propagate to parent
         if let Some(parent) = self.validation_stack.last_mut() {
             match validation_attempted {
@@ -3857,6 +4063,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     parent.any_child_not_full = true;
                     parent.any_child_not_none = true;
                 }
+            }
+            // Only a strictly assessed parent can turn invalid (clause 1.2);
+            // a laxly assessed one stays `notKnown` (clause 2).
+            if invalidates_parent && parent.strictly_assessed {
+                invalidate(&mut parent.validity);
             }
         }
 
@@ -4401,6 +4612,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
+    /// [`invalidate`] the current element (stack top): a `valid` verdict
+    /// turns `invalid`; `notKnown` stays (unlike
+    /// [`mark_current_invalid`](Self::mark_current_invalid)).
+    fn invalidate_current(&mut self) {
+        if let Some(s) = self.validation_stack.last_mut() {
+            invalidate(&mut s.validity);
+        }
+    }
+
     /// Get the effective base URI for the current element (or the document
     /// base URI if no element is on the stack).
     fn current_element_base_uri(&self) -> String {
@@ -4827,10 +5047,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let ic_keys: Vec<IdentityConstraintKey> = self.schema_set.arenas.elements[ek]
                     .identity_constraints
                     .clone();
+                // The element was pushed before this call: it is the stack top.
+                let owner_depth = self.validation_stack.len().saturating_sub(1);
                 for ic_key in ic_keys {
                     if self.ensure_compiled(ic_key) {
                         let compiled = self.compiled_constraints[&ic_key].as_ref().unwrap();
                         let mut cs = ConstraintStruct::new(compiled);
+                        cs.owner_depth = owner_depth;
                         cs.activate();
                         self.active_constraints.push(cs);
                     }
@@ -4842,6 +5065,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// Process identity constraints at element end: advance fields/selectors,
     /// deactivate finished constraints, and perform scope-local keyref
     /// cross-reference.
+    ///
+    /// `validity` and `serial` are the closing element's `[validity]` and
+    /// element serial: a violation of a constraint that element carries (its
+    /// scope just closed, or a field or selector match finished here) makes it
+    /// invalid (§3.3.4.3 clause 6).
+    #[allow(clippy::too_many_arguments)]
     fn process_constraints_end_element(
         &mut self,
         text_content: &str,
@@ -4849,6 +5078,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         is_nil: bool,
         is_complex_content: bool,
         error_codes: &mut Vec<&'static str>,
+        validity: &mut SchemaValidity,
+        serial: u64,
     ) {
         // 1. Advance all constraints (field value collection + key sequence
         //    finalization). Gated on a non-empty active list so the common
@@ -4871,10 +5102,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     element_path,
                     location.clone(),
                 );
-                ic_errors.extend(errs);
+                let owner_depth = cs.owner_depth;
+                ic_errors.extend(errs.into_iter().map(|err| (err, owner_depth)));
             }
-            for err in ic_errors {
+            for (err, owner_depth) in ic_errors {
                 self.emit_error_to(err, error_codes);
+                self.invalidate_ic_owner(owner_depth, validity);
             }
         }
 
@@ -4893,6 +5126,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if !deactivated.is_empty() {
             let mut scope_keyrefs: Vec<(KeyTable, Option<IdentityConstraintKey>)> = Vec::new();
 
+            // Deactivated constraints belong to the closing element (their
+            // scope element): a keyref failure below is its violation.
             for cs in deactivated {
                 if cs.key_table.kind == IdentityKind::Keyref {
                     // Extract the resolved refer_key from the compiled constraint
@@ -4932,16 +5167,88 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 match target {
                     Some(target_table) => {
                         let errs = keyref_table.check_keyref_against(target_table, name_table);
+                        if !errs.is_empty() {
+                            invalidate(validity);
+                        }
                         for err in errs {
                             self.emit_error_to(err, error_codes);
                         }
                     }
                     None => {
-                        // Target not yet in scope — defer to ancestor element end
-                        self.deferred_keyrefs.push((keyref_table, refer_key));
+                        // Target not yet in scope — defer to ancestor element end.
+                        // A later failure invalidates this (closing) element —
+                        // when it is retried still within this close — or the
+                        // open ancestors its verdict reaches.
+                        let mut reach = self.invalidity_reach();
+                        reach.push(serial);
+                        self.deferred_keyrefs.push(DeferredKeyref {
+                            table: keyref_table,
+                            refer_key,
+                            reach,
+                        });
                     }
                 }
             }
+        }
+    }
+
+    /// An identity-constraint violation makes the constraint's owner element
+    /// invalid (§3.3.4.3 clause 6). `closing` is the `[validity]` of the
+    /// element being closed, already popped off the stack: it is the owner
+    /// when `owner_depth` equals the stack length.
+    fn invalidate_ic_owner(&mut self, owner_depth: usize, closing: &mut SchemaValidity) {
+        if owner_depth == self.validation_stack.len() {
+            invalidate(closing);
+        } else {
+            self.invalidate_open_ic_owner(owner_depth);
+        }
+    }
+
+    /// [`invalidate_ic_owner`](Self::invalidate_ic_owner) for a violation
+    /// found while the owner is still open (on the validation stack).
+    fn invalidate_open_ic_owner(&mut self, owner_depth: usize) {
+        if let Some(owner) = self.validation_stack.get_mut(owner_depth) {
+            invalidate(&mut owner.validity);
+        }
+    }
+
+    /// For an element that just closed (already popped): the serial numbers of
+    /// the open ancestors its `invalid` would still reach — the unbroken run
+    /// of strictly assessed elements from its parent upward (§3.3.5.1
+    /// `[validity]` clause 1.1.2; a laxly assessed ancestor is `notKnown`,
+    /// clause 2, and stops the run). Used for a verdict on that element that
+    /// is only known later, after the ancestors in the run may have closed.
+    fn invalidity_reach(&self) -> Vec<u64> {
+        let run = self
+            .validation_stack
+            .iter()
+            .rev()
+            .take_while(|ev| ev.strictly_assessed)
+            .count();
+        let start = self.validation_stack.len() - run;
+        self.validation_stack[start..]
+            .iter()
+            .map(|ev| ev.element_serial)
+            .collect()
+    }
+
+    /// Apply a late verdict on an element that has closed: invalidate the
+    /// deepest still-open element of its `reach` (see
+    /// [`invalidity_reach`](Self::invalidity_reach)) — `closing` (the element
+    /// being closed now, already popped) if it is in the reach, else the
+    /// innermost stack entry that is. Every other open member of the reach is
+    /// an ancestor of that one and follows through the usual child→parent
+    /// propagation when it closes.
+    fn invalidate_late(&mut self, reach: &[u64], closing: &mut ElementValidationState) {
+        if reach.contains(&closing.element_serial) {
+            invalidate(&mut closing.validity);
+        } else if let Some(open) = self
+            .validation_stack
+            .iter_mut()
+            .rev()
+            .find(|ev| reach.contains(&ev.element_serial))
+        {
+            invalidate(&mut open.validity);
         }
     }
 
@@ -4972,12 +5279,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// Check if an ENTITY/ENTITIES value names declared unparsed entities.
     ///
     /// §3.16.4 String Valid clause 3: "Every ENTITY value in V is a declared
-    /// entity name." Only checked when `unparsed_entities` is set.
-    fn check_entity_declared(&mut self, typed_value: &XmlValue) {
+    /// entity name." Only checked when `unparsed_entities` is set. Returns
+    /// `true` when an undeclared name was reported: the value is then not
+    /// String Valid, and the caller invalidates the item that carries it.
+    fn check_entity_declared(&mut self, typed_value: &XmlValue) -> bool {
         use crate::types::value::XmlValueKind;
         let entities = match &self.unparsed_entities {
             Some(e) => e,
-            None => return,
+            None => return false,
         };
         // Collect undeclared names first to avoid borrow conflict with report_error
         let mut undeclared: Vec<String> = Vec::new();
@@ -5001,12 +5310,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
 
+        let any_undeclared = !undeclared.is_empty();
         for name in undeclared {
             self.report_error(
                 "cvc-datatype-valid.1.2.1",
                 format!("ENTITY '{}' is not declared as an unparsed entity", name),
             );
         }
+        any_undeclared
     }
 
     /// Register an ID value with its owner element serial.
@@ -5019,6 +5330,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             Some(&existing_serial) => {
                 if !(self.schema_set.is_xsd11() && existing_serial == owner_serial) {
                     self.report_error("cvc-id.2", format!("Duplicate ID value '{}'", value));
+                    // A verdict on the validation root, applied when it closes.
+                    self.root_id_conflict = true;
                 }
             }
             None => {
@@ -5464,16 +5777,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         namespace: Option<NameId>,
     ) {
         let ns = namespace.unwrap_or(NameId(0));
-        let mut multi_node_ic: Vec<(NameId, usize)> = Vec::new();
+        let mut multi_node_ic: Vec<(NameId, usize, usize)> = Vec::new();
         for cs in &mut self.active_constraints {
             let matches = cs.matching_fields(local_name, ns);
             for field_idx in matches {
                 if cs.increment_field_match_count(field_idx) {
-                    multi_node_ic.push((cs.key_table.constraint_name, field_idx));
+                    multi_node_ic.push((cs.key_table.constraint_name, field_idx, cs.owner_depth));
                 }
             }
         }
-        for (constraint_name, field_idx) in multi_node_ic {
+        for (constraint_name, field_idx, owner_depth) in multi_node_ic {
             let name = self
                 .schema_set
                 .name_table
@@ -5487,6 +5800,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     field_idx + 1
                 ),
             );
+            self.invalidate_open_ic_owner(owner_depth);
         }
     }
 
@@ -5523,6 +5837,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 .map_or(0, |ev| ev.error_codes.len());
             let mut info =
                 self.validate_attribute_against_type(ct_key, *local_name, *namespace, value);
+            self.fold_attribute_validity(&info);
             if let Some(ev) = self.validation_stack.last_mut() {
                 if ev.error_codes.len() > ec_snapshot {
                     info.schema_error_codes = ev.error_codes[ec_snapshot..].to_vec();
@@ -5583,18 +5898,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 &self.schema_set.name_table,
             )
             .or_else(|| result.typed_value.clone());
-            let mut multi_node_ic: Vec<(NameId, usize)> = Vec::new();
+            let mut multi_node_ic: Vec<(NameId, usize, usize)> = Vec::new();
             for cs in &mut self.active_constraints {
                 let matches = cs.matching_fields(local_name, ns);
                 for field_idx in matches {
                     let already_matched =
                         cs.set_field_value(field_idx, value.to_string(), ic_typed_value.clone());
                     if already_matched {
-                        multi_node_ic.push((cs.key_table.constraint_name, field_idx));
+                        multi_node_ic.push((
+                            cs.key_table.constraint_name,
+                            field_idx,
+                            cs.owner_depth,
+                        ));
                     }
                 }
             }
-            for (constraint_name, field_idx) in multi_node_ic {
+            for (constraint_name, field_idx, owner_depth) in multi_node_ic {
                 let name = self
                     .schema_set
                     .name_table
@@ -5608,6 +5927,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         field_idx + 1
                     ),
                 );
+                self.invalidate_open_ic_owner(owner_depth);
             }
         }
 
@@ -5619,7 +5939,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 .map(|e| e.element_serial)
                 .unwrap_or(0);
             self.collect_id_idref(tv, value, owner);
-            self.check_entity_declared(tv);
+            if self.check_entity_declared(tv) {
+                self.invalidate_attribute_owner();
+            }
 
             // NOTATION tracking (§3.14.5): set [notation] on parent element
             if tv.type_code == XmlTypeCode::Notation {
