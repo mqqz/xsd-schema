@@ -704,9 +704,10 @@ This list names them by theme; each point is detailed under *Fixed*, or under
   compared, so whitespace between them no longer counts; with mixed content
   the `(*|text())` sequences are compared, as before. An element annotated as
   having simple content is never deep-equal to one with complex content.
-  Reading the content kind of a complex type needs the static context's schema
-  set: without one every element is `xs:untyped`, which is mixed complex
-  content, and the result is what it was.
+  Without a schema set in the static context the content kind of a complex
+  type is not read: the element's typed value decides between simple and
+  complex content, complex content is compared as mixed, and a nilled element
+  of a complex type is compared as having the other element's content kind.
 - `fn:deep-equal` compares two attributes' typed values with `eq` semantics,
   the same rule it applies to a free-standing atomic item, instead of plain
   value equality. The two answers could differ for schema-validated

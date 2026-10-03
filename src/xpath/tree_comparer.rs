@@ -94,6 +94,13 @@ enum ElementContent {
     /// is complex content and mixed, so every node of an unvalidated document
     /// lands here.
     Mixed,
+    /// The case cannot be told: a nilled element of a complex type, with no
+    /// schema set to read the type's content kind from. Its typed value is the
+    /// empty sequence whatever that kind is, so the typed value does not tell
+    /// simple content from complex content either. It is not a case of the
+    /// rule; [`NodeComparer::element_content_equal`] resolves it against the
+    /// other element.
+    Unknown,
 }
 
 /// The comparison engine behind [`TreeComparer`] and `fn:deep-equal`.
@@ -144,9 +151,12 @@ impl<'s> NodeComparer<'s> {
     ///
     /// `schema_set` is the static context's schema set, used to read a complex
     /// type's content kind — element-only, mixed or empty — which decides
-    /// which of the rule's clause-4 cases applies. `None` (the usual case: no
-    /// schema was imported) makes every element untyped, i.e. `xs:untyped`,
-    /// i.e. mixed complex content, which is the unvalidated behaviour.
+    /// which of the rule's clause-4 cases applies. With `None` (the usual case:
+    /// no schema was imported) an element's typed value decides between simple
+    /// and complex content, and complex content is compared as mixed, which is
+    /// the unvalidated behaviour; see
+    /// [`element_content`](Self::element_content) for the details, nilled
+    /// elements included.
     ///
     /// `ignore_whitespace` is `false`: `fn:deep-equal` compares text nodes
     /// exactly, and the option exists for test harnesses, not for the function.
@@ -282,8 +292,25 @@ impl<'s> NodeComparer<'s> {
     /// both sides — so an element-only element and a mixed one are not
     /// deep-equal even when their element children match, because no case of
     /// clause (4) covers the pair.
+    ///
+    /// An element whose case cannot be told ([`ElementContent::Unknown`], a
+    /// nilled element of a complex type with no schema set) is compared as
+    /// being in the other element's case. The comparison that case prescribes
+    /// is then right for it: a nilled element has an empty typed value and no
+    /// element or text children, which is all 4(a), 4(b) and 4(c) look at. Two
+    /// such elements are compared as mixed, and are equal. What is lost is
+    /// clause (2): without a schema set a nilled element-only element can
+    /// compare equal to a nilled simple-content one — the price of not
+    /// knowing.
     fn element_content_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
-        match (self.element_content(left), self.element_content(right)) {
+        let pair = match (self.element_content(left), self.element_content(right)) {
+            (ElementContent::Unknown, ElementContent::Unknown) => {
+                (ElementContent::Mixed, ElementContent::Mixed)
+            }
+            (ElementContent::Unknown, known) | (known, ElementContent::Unknown) => (known, known),
+            known => known,
+        };
+        match pair {
             // 4(a): compare the typed values.
             (ElementContent::Simple, ElementContent::Simple) => {
                 self.typed_values_equal(left, right)
@@ -311,7 +338,9 @@ impl<'s> NodeComparer<'s> {
     /// Without a schema set the content kind of a complex type cannot be read,
     /// so the node's typed value decides simple-vs-complex on its own and
     /// complex content is treated as mixed — the same answer an unvalidated
-    /// document gives.
+    /// document gives. A nilled element is the exception: its typed value is
+    /// the empty sequence whether its type has simple or complex content, so
+    /// it is [`ElementContent::Unknown`].
     fn element_content<N: DomNavigator>(&self, nav: &N) -> ElementContent {
         match nav.type_annotation() {
             None => ElementContent::Mixed,
@@ -324,7 +353,8 @@ impl<'s> NodeComparer<'s> {
                 Some(ContentType::Mixed) => ElementContent::Mixed,
                 None => match nav.typed_value() {
                     TypedValue::Value(_) => ElementContent::Simple,
-                    _ => ElementContent::Mixed,
+                    TypedValue::Nilled => ElementContent::Unknown,
+                    TypedValue::Untyped | TypedValue::Absent => ElementContent::Mixed,
                 },
             },
         }
@@ -1378,6 +1408,160 @@ mod tests {
                 element(&typed),
                 element(&untyped),
             ));
+        }
+
+        /// One nillable `e` per parent, so that the elements compared share a
+        /// name: under `s` it has a simple type, under `f` a complex type with
+        /// simple content, under `p` a complex type with element-only content.
+        const NILLABLE_E: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="flag">
+                    <xs:simpleContent>
+                        <xs:extension base="xs:boolean"/>
+                    </xs:simpleContent>
+                </xs:complexType>
+                <xs:complexType name="pair">
+                    <xs:sequence>
+                        <xs:element name="c" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:element name="doc">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="s">
+                                <xs:complexType><xs:sequence>
+                                    <xs:element name="e" type="xs:boolean" nillable="true"/>
+                                </xs:sequence></xs:complexType>
+                            </xs:element>
+                            <xs:element name="f">
+                                <xs:complexType><xs:sequence>
+                                    <xs:element name="e" type="flag" nillable="true"/>
+                                </xs:sequence></xs:complexType>
+                            </xs:element>
+                            <xs:element name="p">
+                                <xs:complexType><xs:sequence>
+                                    <xs:element name="e" type="pair" nillable="true"/>
+                                </xs:sequence></xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#;
+
+        const ALL_NILLED: &str = concat!(
+            r#"<doc xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#,
+            r#"<s><e xsi:nil="true"/></s><f><e xsi:nil="true"/></f><p><e xsi:nil="true"/></p>"#,
+            r#"</doc>"#
+        );
+
+        const NONE_NILLED: &str =
+            "<doc><s><e>true</e></s><f><e>true</e></f><p><e><c>x</c></e></p></doc>";
+
+        /// The `e` child of the document element's `parent` child.
+        fn e_under<'a>(doc: &'a BufferDocument<'a>, parent: &str) -> BufferDocNavigator<'a> {
+            let mut nav = element(doc);
+            assert!(nav.move_to_child_name(parent, ""), "a {parent} child");
+            assert!(nav.move_to_child_name("e", ""), "an e child of {parent}");
+            nav
+        }
+
+        /// Clauses (2) and (4) alone, without the name and attribute checks
+        /// that come first: a nilled element carries `xsi:nil="true"`, so its
+        /// attributes already tell it from one that is not nilled.
+        fn content_equal(
+            schema_set: Option<&SchemaSet>,
+            left: &BufferDocNavigator<'_>,
+            right: &BufferDocNavigator<'_>,
+        ) -> bool {
+            NodeComparer::deep_equal_function(schema_set, CollationRef::Codepoint)
+                .element_content_equal(left, right)
+        }
+
+        /// Review finding: a nilled element whose complex type has simple
+        /// content has the typed value of every nilled element, the empty
+        /// sequence, so without a schema set it cannot be told from a nilled
+        /// complex-content element. It is compared as having the other
+        /// element's content kind — here simple, so the two empty typed values
+        /// are compared, and are equal, with the schema set and without it.
+        #[test]
+        fn a_nilled_simple_content_element_equals_a_nilled_simple_typed_one() {
+            let schema_set = load_schema(NILLABLE_E);
+            let arena = Bump::new();
+            let doc = typed_doc(ALL_NILLED, &arena, &schema_set);
+
+            for schema in [None, Some(&schema_set)] {
+                assert!(
+                    deep_equal(schema, e_under(&doc, "s"), e_under(&doc, "f")),
+                    "xs:boolean against an extension of it (schema set: {})",
+                    schema.is_some(),
+                );
+                assert!(
+                    deep_equal(schema, e_under(&doc, "f"), e_under(&doc, "s")),
+                    "an extension of xs:boolean against xs:boolean (schema set: {})",
+                    schema.is_some(),
+                );
+            }
+        }
+
+        /// Taking the other element's content kind is only lenient where
+        /// nothing can differ: against a simple-typed element *with* a value,
+        /// the nilled element's empty typed value is compared with that value,
+        /// and the two are not equal.
+        #[test]
+        fn a_nilled_element_does_not_equal_a_simple_element_with_a_value() {
+            let schema_set = load_schema(NILLABLE_E);
+            let arena = Bump::new();
+            let nilled = typed_doc(ALL_NILLED, &arena, &schema_set);
+            let valued = typed_doc(NONE_NILLED, &arena, &schema_set);
+
+            for schema in [None, Some(&schema_set)] {
+                let flag = e_under(&nilled, "f");
+                let boolean = e_under(&valued, "s");
+                assert!(
+                    !content_equal(schema, &flag, &boolean),
+                    "schema set: {}",
+                    schema.is_some()
+                );
+                assert!(
+                    !content_equal(schema, &boolean, &flag),
+                    "schema set: {}",
+                    schema.is_some()
+                );
+                assert!(!deep_equal(schema, flag, boolean));
+            }
+        }
+
+        /// With a schema set the content kind is read from the type, so a
+        /// nilled element-only element is still never deep-equal to a nilled
+        /// simple-content one (clause (2)). Without a schema set neither nilled
+        /// complex-typed element can be told apart, and the leniency lets them
+        /// compare equal — the price of not knowing.
+        #[test]
+        fn a_nilled_element_only_element_is_not_a_nilled_simple_one_with_a_schema_set() {
+            let schema_set = load_schema(NILLABLE_E);
+            let arena = Bump::new();
+            let doc = typed_doc(ALL_NILLED, &arena, &schema_set);
+
+            assert!(!deep_equal(
+                Some(&schema_set),
+                e_under(&doc, "p"),
+                e_under(&doc, "s"),
+            ));
+            assert!(!deep_equal(
+                Some(&schema_set),
+                e_under(&doc, "s"),
+                e_under(&doc, "p"),
+            ));
+            assert!(!deep_equal(
+                Some(&schema_set),
+                e_under(&doc, "p"),
+                e_under(&doc, "f"),
+            ));
+
+            assert!(deep_equal(None, e_under(&doc, "p"), e_under(&doc, "s")));
+            assert!(deep_equal(None, e_under(&doc, "s"), e_under(&doc, "p")));
+            // Two elements whose kind cannot be told are compared as mixed:
+            // neither has a child, so they are equal.
+            assert!(deep_equal(None, e_under(&doc, "p"), e_under(&doc, "f")));
         }
     }
 }

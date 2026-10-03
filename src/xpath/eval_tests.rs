@@ -4234,6 +4234,48 @@ mod xpath10_compatibility_conversion_tests {
         assert_eq!(eval_on("compare((), '')", XML, false).unwrap(), "");
     }
 
+    /// `fn:number` of an untyped node in compatibility mode: `V[1]`, then the
+    /// typed value — the string value as `xs:untypedAtomic` — converted as F&O
+    /// §14.4 converts it, with the XML Schema lexical forms of `xs:double`.
+    #[test]
+    fn compatibility_mode_number_of_an_untyped_node() {
+        const TWO: &str = "<r><a>7</a><a>8</a></r>";
+        let cases: &[(&str, &str, bool, &str)] = &[
+            // XML whitespace around the number is ignored.
+            ("number(/a)", "<a> 12 </a>", true, "12"),
+            ("/a/number()", "<a> 12 </a>", true, "12"),
+            // `Infinity` is not an `xs:double` lexical form (`INF` is), and a
+            // no-break space is not XML whitespace — with the flag as without.
+            ("number(/a)", "<a>Infinity</a>", true, "NaN"),
+            ("/a/number()", "<a>Infinity</a>", true, "NaN"),
+            ("number(/a)", "<a>\u{a0}12</a>", true, "NaN"),
+            ("number(/a)", "<a>INF</a>", true, "INF"),
+            ("number(/a)", "<a>Infinity</a>", false, "NaN"),
+            ("/a/number()", "<a>Infinity</a>", false, "NaN"),
+            ("number(/a)", "<a>\u{a0}12</a>", false, "NaN"),
+            ("number(/a)", "<a>INF</a>", false, "INF"),
+            // More than one node: the first item…
+            ("number(//a)", TWO, true, "7"),
+            ("number((//a)[. > 7])", TWO, true, "8"),
+            // …in sequence order, not document order.
+            ("number(((//a)[2], //a[1]))", TWO, true, "8"),
+            // With the flag off, more than one item is a type error.
+            ("number(//a)", TWO, false, "error:XPTY0004"),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|&(expr, xml, compat, expected)| {
+                let got = outcome(eval_on(expr, xml, compat));
+                (got != expected).then(|| {
+                    format!(
+                        "{expr} over {xml} (compat {compat})  =>  {got}   (expected {expected})"
+                    )
+                })
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     #[test]
     fn nothing_changes_when_the_flag_is_off() {
         // The same expressions under XPath 2.0 rules.
@@ -4892,6 +4934,7 @@ mod list_atomization_tests {
             <xs:element name="emp">
               <xs:complexType><xs:attribute name="k" type="xs:string"/></xs:complexType>
             </xs:element>
+            <xs:element name="bo" type="xs:boolean" maxOccurs="2"/>
           </xs:sequence>
           <xs:attribute name="l" type="idList"/>
           <xs:attribute name="one" type="idList"/>
@@ -4912,7 +4955,7 @@ mod list_atomization_tests {
         r#"<l>p q</l><sc kind="k">4 5</sc><ni xsi:nil="true"/>"#,
         r#"<d>1 NaN</d><d> 1  NaN </d><d>1 2</d>"#,
         r#"<p n="1 2 3" r="a b"/><p n=" 1  2   3 " r="c"/><p n="1 2 4"/><lu>1 1.0e0</lu>"#,
-        r#"<any>text</any><mx>a<i>b</i>c</mx><emp k="v"/>"#,
+        r#"<any>text</any><mx>a<i>b</i>c</mx><emp k="v"/><bo>true</bo><bo>false</bo>"#,
         r#"</doc>"#
     );
 
@@ -5168,6 +5211,39 @@ mod list_atomization_tests {
                 ("/doc/@n + 1", "2"),
                 ("/doc/@e + 1", "NaN"),
                 ("string(/doc/@l)", "a b"),
+            ],
+            true,
+        );
+    }
+
+    /// Review finding: `fn:number` in XPath 1.0 compatibility mode. Its
+    /// parameter is `xs:anyAtomicType?`, so of the §3.1.5 compatibility steps
+    /// only `V[1]` applies, and the normal rules follow: the node is atomized
+    /// to its typed value, which `fn:number` converts. Reading the string value
+    /// made a typed `true` NaN.
+    #[test]
+    fn compatibility_mode_number_atomizes_a_typed_node() {
+        check(
+            &[
+                ("number(/doc/bo[1])", "1"),
+                ("number(/doc/bo[2])", "0"),
+                ("/doc/bo[1]/number()", "1"),
+                ("number(/doc/@b)", "1"),
+                ("/doc/@b/number()", "1"),
+                ("number(/doc/@n1)", "5"),
+                // `V[1]` is the first node, then its typed value.
+                ("number(/doc/bo)", "1"),
+                ("number((/doc/bo[2], /doc/bo[1]))", "0"),
+                // The typed value is empty: NaN.
+                ("number(/doc/@e)", "NaN"),
+                ("number(/doc/ni)", "NaN"),
+                // `V[1]` is the one attribute; its typed value has two members
+                // (`@l`) or three (`@n`), which `xs:anyAtomicType?` does not
+                // match.
+                ("number(/doc/@l)", "error:XPTY0004"),
+                ("number(/doc/@n)", "error:XPTY0004"),
+                // Element-only content has no typed value.
+                ("number(/doc)", "error:FOTY0012"),
             ],
             true,
         );

@@ -990,6 +990,16 @@ fn eval_fn_string<N: DomNavigator>(
     }
 }
 
+/// `fn:number` (F&O §14.4).
+///
+/// XPath 1.0 compatibility mode needs nothing of its own here. The parameter
+/// is `xs:anyAtomicType?`, so of the three compatibility steps of the function
+/// conversion rules (XPath 2.0 §3.1.5) only the first applies — "the value V
+/// is effectively replaced by V\[1\]" — and the evaluator has already taken it
+/// for every function call before dispatch (`apply_function_conversion_10` in
+/// `eval.rs`). The normal rules follow, in either mode: the argument is
+/// atomized, so a node contributes its typed value rather than its string
+/// value, and a value that does not convert is NaN.
 fn eval_fn_number<N: DomNavigator>(
     context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
@@ -1000,24 +1010,11 @@ fn eval_fn_number<N: DomNavigator>(
             // context item after atomization, so a typed node contributes its
             // typed value, exactly as it does when passed as the argument.
             let item = context.require_context_item()?.clone();
-            let arg = XPathValue::from_item(item);
-            let d = if context.static_context.xpath10_compatibility() {
-                atomize::to_number_10(&arg)
-            } else {
-                atomize_to_double(arg)?
-            };
+            let d = atomize_to_double(XPathValue::from_item(item))?;
             Ok(XPathValue::double(d))
         }
         1 => {
-            let arg = args.remove(0);
-            // XPath 1.0 compatibility mode: first item, then the 1.0 number
-            // rules (a value that is not a number becomes NaN rather than an
-            // error).
-            let d = if context.static_context.xpath10_compatibility() {
-                atomize::to_number_10(&arg)
-            } else {
-                atomize_to_double(arg)?
-            };
+            let d = atomize_to_double(args.remove(0))?;
             Ok(XPathValue::double(d))
         }
         _ => Err(XPathError::wrong_number_of_arguments(
