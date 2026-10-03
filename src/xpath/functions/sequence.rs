@@ -129,17 +129,23 @@ pub fn index_of<N: DomNavigator>(
 
 /// Compare two atomic values for equality (used by index-of and distinct-values).
 ///
-/// Normalizes UntypedAtomic and AnyUri to string, which is the `eq` rule of
-/// XPath 2.0 §3.5.1 ("If the atomized operand is of type xs:untypedAtomic, it
-/// is cast to xs:string"), and applies numeric type promotion for comparing
-/// different numeric types. A pair whose types `eq` is not defined for — an
-/// `xs:integer` against an `xs:string`, say — compares unequal rather than
-/// raising, which is F&O §15.1.5's "considered to be distinct".
+/// F&O §15.1.5 (`fn:index-of`): "The items in the sequence $seqParam are
+/// compared with $srchParam under the rules for the eq operator. Values of
+/// type xs:untypedAtomic are compared as if they were of type xs:string.
+/// Values that cannot be compared, i.e. the eq operator is not defined for
+/// their types, are considered to be distinct." So this is the `eq` operator
+/// itself ([`value_eq_collated`](crate::xpath::operators::value_eq_collated)),
+/// under `collation`, with a pair `eq` is not defined for — an `xs:integer`
+/// against an `xs:string`, say — answering `false` instead of raising. Two
+/// string-like values compare by their string values whatever their types:
+/// `xs:token('a')`, an `xs:NMTOKEN` list member and an `xs:ID` all equal the
+/// `xs:string` `'a'`, as they do under `eq`.
 ///
-/// The two string-like values that normalization produces are compared under
-/// `collation`; every other pair ignores it. The only error this can raise is
-/// therefore FOCH0002 from an unsupported collation, and only for a pair that
-/// actually needed one.
+/// Numeric pairs keep the exact promotion below (decimal↔integer compared as
+/// decimals, float and double promoted), which is `eq`'s as well.
+///
+/// The only error this can raise is therefore FOCH0002 from an unsupported
+/// collation, and only for a pair that actually needed one.
 fn values_equal(
     left: &XmlValue,
     right: &XmlValue,
@@ -153,19 +159,23 @@ fn values_equal(
         return Ok(numeric_values_equal(&left_norm, &right_norm));
     }
 
-    // A string-like pair is what the collation governs. The branch is entered
-    // only for a non-codepoint collation, so the codepoint path keeps the
-    // structural `XmlValue` equality below — which also compares the two type
-    // codes, and is what this function has always done.
-    if !collation.is_codepoint()
-        && crate::xpath::operators::is_string_like(left_norm.type_code)
-        && crate::xpath::operators::is_string_like(right_norm.type_code)
-    {
-        return collation.equals(&left_norm.to_string_value(), &right_norm.to_string_value());
-    }
+    eq_or_distinct(&left_norm, &right_norm, collation)
+}
 
-    // Use value equality for non-numeric types
-    Ok(left_norm == right_norm)
+/// `left eq right` under `collation`, where a pair the `eq` operator is not
+/// defined for is simply unequal (F&O §15.1.5, §15.1.6: "considered to be
+/// distinct"). Any other error — FOCH0002 for an unsupported collation — is
+/// raised.
+fn eq_or_distinct(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    match crate::xpath::operators::value_eq_collated(left, right, collation) {
+        Ok(equal) => Ok(equal),
+        Err(XPathError::BinaryOperatorNotDefined { .. }) => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// Compare two numeric values for equality using XPath 2.0 type promotion.
@@ -230,7 +240,13 @@ fn numeric_values_equal_inner(left: &XmlValue, right: &XmlValue, nan_equal: bool
 }
 
 /// Compare two values for equality for fn:distinct-values.
-/// Like values_equal but treats NaN as equal to NaN per XPath 2.0 spec.
+///
+/// F&O §15.1.6: "Equality must be defined for the type of the items … The
+/// values are compared using the eq operator" with "xs:untypedAtomic …
+/// compared as if they were of type xs:string", "Values that cannot be compared,
+/// i.e. the eq operator is not defined for their types, are considered to be
+/// distinct", and — unlike `eq` — NaN equal to NaN. So this is
+/// [`values_equal`] except for the NaN rule.
 fn distinct_values_equal(
     left: &XmlValue,
     right: &XmlValue,
@@ -244,53 +260,10 @@ fn distinct_values_equal(
         return Ok(numeric_values_equal_inner(&left_norm, &right_norm, true));
     }
 
-    // Duration cross-type comparison: P0M == PT0S (both are zero duration)
-    if is_duration_code(left_norm.type_code) && is_duration_code(right_norm.type_code) {
-        return Ok(durations_equal(&left_norm, &right_norm));
-    }
-
-    // See `values_equal`: the collation governs string-like pairs and nothing
-    // else, and the codepoint path is untouched.
-    if !collation.is_codepoint()
-        && crate::xpath::operators::is_string_like(left_norm.type_code)
-        && crate::xpath::operators::is_string_like(right_norm.type_code)
-    {
-        return collation.equals(&left_norm.to_string_value(), &right_norm.to_string_value());
-    }
-
-    // Use value equality for non-numeric types
-    Ok(left_norm == right_norm)
-}
-
-fn is_duration_code(code: XmlTypeCode) -> bool {
-    matches!(
-        code,
-        XmlTypeCode::Duration | XmlTypeCode::YearMonthDuration | XmlTypeCode::DayTimeDuration
-    )
-}
-
-/// Compare two duration values for equality.
-/// Handles cross-type comparison (YearMonthDuration vs DayTimeDuration).
-fn durations_equal(left: &XmlValue, right: &XmlValue) -> bool {
-    // Same type: use regular equality
-    if left.type_code == right.type_code {
-        return left == right;
-    }
-    // Cross-type: only zero durations are comparable and equal
-    is_zero_duration(left) && is_zero_duration(right)
-}
-
-/// Check if a duration value is zero.
-fn is_zero_duration(value: &XmlValue) -> bool {
-    match &value.value {
-        crate::types::value::XmlValueKind::Atomic(XmlAtomicValue::YearMonthDuration(d)) => {
-            d.years == 0 && d.months == 0
-        }
-        crate::types::value::XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(d)) => {
-            d.days == 0 && d.hours == 0 && d.minutes == 0 && d.seconds.is_zero()
-        }
-        _ => false,
-    }
+    // Everything else is `eq`: durations compare across their subtypes
+    // (`P0M eq PT0S`, `P12M eq P1Y`), dates and times by their timeline value,
+    // QNames by expanded name, strings under the collation.
+    eq_or_distinct(&left_norm, &right_norm, collation)
 }
 
 /// Normalize a value for comparison (UntypedAtomic and AnyUri become string).

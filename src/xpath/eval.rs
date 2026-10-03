@@ -47,8 +47,9 @@ use crate::xpath::node_test::{
 };
 use crate::xpath::operators::cast_to_qname_with_context;
 use crate::xpath::operators::{
-    eval_binary, eval_numeric_binary_10, eval_range, eval_unary, general_eq_iter, general_ge_iter,
-    general_gt_iter, general_le_iter, general_lt_iter, general_ne_iter,
+    eval_binary, eval_numeric_binary_10, eval_range, eval_unary, general_eq_iter_collated,
+    general_ge_iter_collated, general_gt_iter_collated, general_le_iter_collated,
+    general_lt_iter_collated, general_ne_iter_collated,
 };
 use crate::xpath::sequence_ops::{except_nodes, intersect_nodes, union_nodes};
 use crate::xpath::DomNodeType;
@@ -266,7 +267,7 @@ pub fn eval_node<N: DomNavigator>(
                 // Logical operators - short-circuit evaluation
                 BinaryOpKind::And => {
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
-                    let left_bool = if ctx.static_context.xpath10_compatibility() {
+                    let left_bool = if ebv_is_xpath10(ctx.static_context) {
                         effective_boolean_value_10(&left_val)?
                     } else {
                         effective_boolean_value(&left_val)?
@@ -275,7 +276,7 @@ pub fn eval_node<N: DomNavigator>(
                         return Ok(XPathValue::boolean(false));
                     }
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
-                    let right_bool = if ctx.static_context.xpath10_compatibility() {
+                    let right_bool = if ebv_is_xpath10(ctx.static_context) {
                         effective_boolean_value_10(&right_val)?
                     } else {
                         effective_boolean_value(&right_val)?
@@ -284,7 +285,7 @@ pub fn eval_node<N: DomNavigator>(
                 }
                 BinaryOpKind::Or => {
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
-                    let left_bool = if ctx.static_context.xpath10_compatibility() {
+                    let left_bool = if ebv_is_xpath10(ctx.static_context) {
                         effective_boolean_value_10(&left_val)?
                     } else {
                         effective_boolean_value(&left_val)?
@@ -293,7 +294,7 @@ pub fn eval_node<N: DomNavigator>(
                         return Ok(XPathValue::boolean(true));
                     }
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
-                    let right_bool = if ctx.static_context.xpath10_compatibility() {
+                    let right_bool = if ebv_is_xpath10(ctx.static_context) {
                         effective_boolean_value_10(&right_val)?
                     } else {
                         effective_boolean_value(&right_val)?
@@ -375,15 +376,16 @@ pub fn eval_node<N: DomNavigator>(
                             // `A eq B` for two `xs:string` values as
                             // `op:numeric-equal(fn:compare(A, B), 0)`. Only the
                             // comparison operators read it; the arithmetic ones
-                            // ignore it, and resolving it costs a discriminant
-                            // test when it is the codepoint collation.
-                            let active =
-                                crate::xpath::collation::resolve_collation_cached(ctx, None);
+                            // ignore it. It is resolved only if two strings
+                            // are actually compared (and then through the
+                            // per-run memo), and costs a discriminant test when
+                            // it is the codepoint collation.
+                            let deferred = ctx.deferred_default_collation();
                             let result = crate::xpath::operators::eval_binary_collated(
                                 bin_op.kind,
                                 &left,
                                 &right,
-                                active.as_ref(),
+                                deferred.as_ref(),
                             )?;
                             Ok(XPathValue::from_atomic(result))
                         }
@@ -401,7 +403,7 @@ pub fn eval_node<N: DomNavigator>(
                     // through `compare_cache`, which may reuse the index of an
                     // operand that does not change during this run. With nothing
                     // to reuse it evaluates both operands in source order and
-                    // calls the very same `general_eq_iter`/`general_ne_iter`.
+                    // calls the very same `general_eq_iter`/`general_ne_iter` code.
                     if !ctx.static_context.xpath10_compatibility()
                         && matches!(
                             bin_op.kind,
@@ -422,16 +424,40 @@ pub fn eval_node<N: DomNavigator>(
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
 
-                    // XPath 1.0 §3.4: node-set vs boolean → convert node-set to boolean as a whole
                     if ctx.static_context.xpath10_compatibility() {
                         let left_is_bool = is_boolean_value(&left_val);
                         let right_is_bool = is_boolean_value(&right_val);
-                        let left_has_nodes = has_nodes_or_empty(&left_val);
-                        let right_has_nodes = has_nodes_or_empty(&right_val);
+                        let mode10 = ebv_is_xpath10(ctx.static_context);
+                        // XPath 1.0 (`XPathMode::XPath10`) §3.4 converts only a
+                        // *node-set* compared with a boolean as a whole; other
+                        // operands are converted pair by pair below, and `<` …
+                        // `>=` convert both sides to numbers. XPath 2.0 §3.5.2,
+                        // in compatibility mode: "If either operand is a single
+                        // atomic value that is an instance of xs:boolean, then
+                        // the other operand is converted to xs:boolean by taking
+                        // its effective boolean value" — whatever it is, for all
+                        // six operators, and with the 2.0 effective boolean
+                        // value (§2.4.3), which is FORG0006 for a sequence of
+                        // two or more atomic values.
+                        let convert_other = if mode10 {
+                            (left_is_bool && has_nodes_or_empty(&right_val))
+                                || (right_is_bool && has_nodes_or_empty(&left_val))
+                        } else {
+                            left_is_bool || right_is_bool
+                        };
 
-                        if (left_is_bool && right_has_nodes) || (right_is_bool && left_has_nodes) {
-                            let l = effective_boolean_value_10(&left_val)?;
-                            let r = effective_boolean_value_10(&right_val)?;
+                        if convert_other {
+                            let (l, r) = if mode10 {
+                                (
+                                    effective_boolean_value_10(&left_val)?,
+                                    effective_boolean_value_10(&right_val)?,
+                                )
+                            } else {
+                                (
+                                    effective_boolean_value(&left_val)?,
+                                    effective_boolean_value(&right_val)?,
+                                )
+                            };
                             let result = match bin_op.kind {
                                 BinaryOpKind::GeneralEq => l == r,
                                 BinaryOpKind::GeneralNe => l != r,
@@ -462,33 +488,39 @@ pub fn eval_node<N: DomNavigator>(
                         // §3.5.2 compares the converted operands with `eq`,
                         // `ne`, …, so two strings are compared under the
                         // default collation, as the value comparisons above
-                        // compare them.
-                        let active = crate::xpath::collation::resolve_collation_cached(ctx, None);
+                        // compare them — resolved only if two strings meet.
+                        let deferred = ctx.deferred_default_collation();
                         crate::xpath::operators::general_compare_iter_10(
                             bin_op.kind,
                             &left_iter,
                             &right_iter,
-                            active.as_ref(),
+                            deferred.as_ref(),
                         )?
                     } else {
+                        // The default collation is resolved only if two strings
+                        // are compared, and then through the per-run memo.
+                        let static_context = ctx.static_context;
+                        let deferred = ctx.deferred_default_collation();
+                        let collation = deferred.as_ref();
+                        let (l, r) = (&left_iter, &right_iter);
                         match bin_op.kind {
                             BinaryOpKind::GeneralEq => {
-                                general_eq_iter(ctx.static_context, &left_iter, &right_iter)?
+                                general_eq_iter_collated(static_context, l, r, collation)?
                             }
                             BinaryOpKind::GeneralNe => {
-                                general_ne_iter(ctx.static_context, &left_iter, &right_iter)?
+                                general_ne_iter_collated(static_context, l, r, collation)?
                             }
                             BinaryOpKind::GeneralLt => {
-                                general_lt_iter(ctx.static_context, &left_iter, &right_iter)?
+                                general_lt_iter_collated(static_context, l, r, collation)?
                             }
                             BinaryOpKind::GeneralLe => {
-                                general_le_iter(ctx.static_context, &left_iter, &right_iter)?
+                                general_le_iter_collated(static_context, l, r, collation)?
                             }
                             BinaryOpKind::GeneralGt => {
-                                general_gt_iter(ctx.static_context, &left_iter, &right_iter)?
+                                general_gt_iter_collated(static_context, l, r, collation)?
                             }
                             BinaryOpKind::GeneralGe => {
-                                general_ge_iter(ctx.static_context, &left_iter, &right_iter)?
+                                general_ge_iter_collated(static_context, l, r, collation)?
                             }
                             _ => unreachable!(),
                         }
@@ -788,20 +820,13 @@ fn eval_castable_as<N: DomNavigator>(
 /// XPath 2.0 states the same rule for arithmetic (§3.4), value comparisons
 /// (§3.5.1), `to` (§3.3.1, via the function conversion rules) and `cast`
 /// (§3.10.2): "If the atomized operand is a sequence of length greater than one,
-/// a type error is raised [err:XPTY0004]." The generic "more than one item"
-/// dynamic error the atomizer raises is therefore turned into that type error
-/// here; every other error passes through unchanged.
+/// a type error is raised [err:XPTY0004]." `expected` names the operand type in
+/// that error.
 fn atomize_operand<N: DomNavigator>(
     value: XPathValue<N>,
     expected: &str,
 ) -> Result<Option<crate::types::XmlValue>, XPathError> {
-    atomize_to_single_opt(value).map_err(|e| match e {
-        XPathError::XPDY0050 => XPathError::XPTY0004 {
-            expected: expected.to_string(),
-            found: "a sequence of more than one item".to_string(),
-        },
-        other => other,
-    })
+    crate::xpath::functions::atomize_at_most_one(value, expected)
 }
 
 /// The first item of an atomized value, discarding the rest.
@@ -1096,6 +1121,24 @@ fn format_kind_test(kind: &crate::xpath::ast::KindTest) -> String {
 // Path Expression Evaluation
 // ============================================================================
 
+/// The node a leading `/` or `//` starts from.
+///
+/// XPath 2.0 §3.2: "A "/" at the beginning of a path expression is an
+/// abbreviation for the initial step (fn:root(self::node()) treat as
+/// document-node())/ … At evaluation time, if the root node above the context
+/// node is not a document node, a dynamic error is raised \[err:XPDY0050\]" —
+/// and the same for "//". A navigator whose tree is rooted at a parentless
+/// element (or any other node that is not a document node) therefore has no
+/// `/`. An assertion navigator keeps answering it: its root is the document
+/// node, whose children it hides, so `//x` there is the empty sequence.
+fn document_root<N: DomNavigator>(context_node: &N) -> Result<N, XPathError> {
+    let root = get_root(context_node);
+    if root.node_type() != DomNodeType::Root {
+        return Err(XPathError::XPDY0050);
+    }
+    Ok(root)
+}
+
 /// Evaluate a path expression.
 ///
 /// Implements XPath 2.0 path expression semantics:
@@ -1110,8 +1153,7 @@ fn eval_path_expr<N: DomNavigator>(
 ) -> Result<XPathValue<N>, XPathError> {
     // Handle root-only path: "/"
     if path_expr.is_absolute && path_expr.steps.is_empty() {
-        let context_node = ctx.require_context_node()?;
-        let root = get_root(context_node);
+        let root = document_root(ctx.require_context_node()?)?;
         return Ok(XPathValue::from_node(root));
     }
 
@@ -1138,8 +1180,7 @@ fn eval_path_expr<N: DomNavigator>(
     // Determine the starting nodes based on path type
     let starting_nodes: Vec<N> = if path_expr.is_absolute {
         // Absolute path: start from document root
-        let context_node = ctx.require_context_node()?;
-        vec![get_root(context_node)]
+        vec![document_root(ctx.require_context_node()?)?]
     } else if first_is_primary {
         // First step is a primary expression - no initial context nodes needed
         Vec::new()
@@ -1371,7 +1412,23 @@ fn eval_axis_step<N: DomNavigator>(
     // Apply axis iterator
     let xpath_ctx = ctx.static_context.clone();
     let want_runs = !step.predicates.is_empty();
-    let stepped = apply_axis_iterator(step.axis, node_test, xpath_ctx, base_iter, want_runs)?;
+    let mut stepped = apply_axis_iterator(step.axis, node_test, xpath_ctx, base_iter, want_runs)?;
+
+    // `element(N, T)` / `attribute(N, T)` (also inside `document-node(...)`):
+    // the runtime node test above carries the name and the kind but not the
+    // TypeName or the nilled clause, so refine its result with the matcher
+    // `instance of` uses (XPath 2.0 §2.5.4.3, §2.5.4.5) — before the
+    // predicates, which see only the nodes the whole test selects.
+    if let AstNodeTest::Kind(kind_test) = &step.test {
+        if kind_test_has_type_name(kind_test) {
+            stepped.retain(|item| match item {
+                XmlItem::Node(nav) => {
+                    crate::xpath::node_test::matches_kind_test(nav, kind_test, ctx.static_context)
+                }
+                XmlItem::Atomic(_) => false,
+            });
+        }
+    }
 
     // Apply predicates if any
     if step.predicates.is_empty() {
@@ -1575,6 +1632,17 @@ fn kind_test_to_item_type(kind: &KindTest, ctx: &XPathContext<'_>) -> ItemType {
     }
 }
 
+/// Whether a kind test names a `TypeName` — `element(N, T)`, `attribute(N, T)`,
+/// or either inside `document-node(...)`.
+fn kind_test_has_type_name(kind: &KindTest) -> bool {
+    match kind {
+        KindTest::Element(test) => test.type_name.is_some(),
+        KindTest::Attribute(test) => test.type_name.is_some(),
+        KindTest::Document(Some(inner)) => kind_test_has_type_name(inner),
+        _ => false,
+    }
+}
+
 /// The raw items an axis step produced, with the boundaries of the runs the
 /// individual input nodes contributed.
 struct AxisStepItems<N: DomNavigator> {
@@ -1584,6 +1652,35 @@ struct AxisStepItems<N: DomNavigator> {
     /// the caller did not ask for the runs. An input node that yielded nothing
     /// contributes no run.
     run_starts: Vec<usize>,
+}
+
+impl<N: DomNavigator> AxisStepItems<N> {
+    /// Keep the items `keep` accepts, in order, and move the run boundaries
+    /// with them; a run left with no item is dropped, as if its input node had
+    /// yielded nothing.
+    fn retain(&mut self, mut keep: impl FnMut(&XmlItem<N>) -> bool) {
+        let items = std::mem::take(&mut self.items);
+        let bounds = std::mem::take(&mut self.run_starts);
+        let mut kept: Vec<XmlItem<N>> = Vec::with_capacity(items.len());
+        let mut starts: Vec<usize> = Vec::with_capacity(bounds.len());
+        let mut run = 0;
+        let mut run_kept_one = false;
+        for (index, item) in items.into_iter().enumerate() {
+            while run + 1 < bounds.len() && bounds[run + 1] <= index {
+                run += 1;
+                run_kept_one = false;
+            }
+            if keep(&item) {
+                if !bounds.is_empty() && !run_kept_one {
+                    starts.push(kept.len());
+                    run_kept_one = true;
+                }
+                kept.push(item);
+            }
+        }
+        self.items = kept;
+        self.run_starts = starts;
+    }
 }
 
 /// Apply an axis iterator to a base iterator.
@@ -1809,7 +1906,7 @@ fn eval_predicates<N: DomNavigator>(
             ctx.context_size = saved_size;
 
             // Check if item should be included
-            let is_10 = ctx.static_context.xpath10_compatibility();
+            let is_10 = ebv_is_xpath10(ctx.static_context);
             let include = match &pred_result {
                 XPathValue::Item(XmlItem::Atomic(value)) if value.type_code.is_numeric() => {
                     // XPath 1.0 §2.4 and 2.0: exact comparison, no rounding
@@ -2107,7 +2204,10 @@ fn extract_single_node<N: DomNavigator>(value: XPathValue<N>) -> Result<Option<N
             } else if items.is_empty() {
                 Ok(None)
             } else {
-                Err(XPathError::more_than_one_item())
+                // XPath 2.0 §3.5.3: "Each operand must be either a single node
+                // or an empty sequence; otherwise a type error is raised
+                // [err:XPTY0004]."
+                Err(crate::xpath::functions::too_many_items("node()?"))
             }
         }
     }
@@ -2115,7 +2215,28 @@ fn extract_single_node<N: DomNavigator>(value: XPathValue<N>) -> Result<Option<N
 
 /// Check if an XPathValue is a single boolean value (XPath 1.0 §3.4 helper).
 fn is_boolean_value<N: DomNavigator>(val: &XPathValue<N>) -> bool {
-    matches!(val, XPathValue::Item(XmlItem::Atomic(v)) if v.type_code == crate::types::XmlTypeCode::Boolean)
+    matches!(
+        val.as_slice(),
+        [XmlItem::Atomic(v)] if v.type_code == crate::types::XmlTypeCode::Boolean
+    )
+}
+
+/// Whether the effective boolean value is XPath 1.0's — only in the XPath 1.0
+/// *language* mode, [`XPathMode::XPath10`], whose grammar cannot build a
+/// sequence of two or more atomic values, so its `boolean()` and XPath 2.0's
+/// agree on everything it can express.
+///
+/// XPath 1.0 *compatibility mode* in an XPath 2.0 expression does not change
+/// the effective boolean value: XPath 2.0 §2.4.3 defines it as "the result of
+/// applying the fn:boolean function to the value", with no compatibility-mode
+/// exception — "In all other cases, fn:boolean raises a type error
+/// \[err:FORG0006\]" — and lists "General comparisons, in XPath 1.0
+/// compatibility mode" among the places that use that same value. What the mode
+/// does change is the function conversion rules (§3.1.5), arithmetic (§3.4),
+/// general comparisons (§3.5.2) and the evaluation order of `and`/`or` (§3.6).
+#[inline]
+fn ebv_is_xpath10(context: &XPathContext<'_>) -> bool {
+    context.mode() == XPathMode::XPath10
 }
 
 /// Check if an XPathValue contains nodes or is empty (i.e., is a node-set in XPath 1.0 terms).

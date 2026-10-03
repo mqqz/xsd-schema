@@ -597,9 +597,24 @@ pub(crate) fn string_of_single<N: DomNavigator>(
             if items.len() == 1 {
                 Ok(item_string_value(items.into_iter().next().unwrap()))
             } else {
-                Err(XPathError::more_than_one_item())
+                Err(too_many_items("zero or one item"))
             }
         }
+    }
+}
+
+/// The error for a value of more than one item where at most one is allowed.
+///
+/// XPath 2.0 §3.1.5, the function conversion rules: "If, after the above
+/// conversions, the resulting value does not match the expected type according
+/// to the rules for SequenceType Matching, a type error is raised
+/// \[err:XPTY0004\]"; the operators state the same rule for their operands
+/// (§3.4, §3.5.1, §3.5.3, §3.10.2). XPDY0050 is `treat as`'s code (§3.10.5),
+/// not this one.
+pub(crate) fn too_many_items(expected: &str) -> XPathError {
+    XPathError::XPTY0004 {
+        expected: expected.to_string(),
+        found: "a sequence of more than one item".to_string(),
     }
 }
 
@@ -641,10 +656,19 @@ pub fn atomize_to_single<N: DomNavigator>(value: XPathValue<N>) -> Result<XmlVal
 /// `None` when the value atomizes to the empty sequence: the empty value, a
 /// nilled element, or a list-typed node with no members (XPath 2.0 §3.4,
 /// §3.5.1: "If the atomized operand is an empty sequence, the result … is an
-/// empty sequence"). More than one item is an error, and so is a single
-/// list-typed node with more than one member (XPTY0004).
+/// empty sequence"). More than one item is a type error (XPTY0004, XPath 2.0
+/// §3.1.5), and so is a single list-typed node with more than one member.
 pub fn atomize_to_single_opt<N: DomNavigator>(
     value: XPathValue<N>,
+) -> Result<Option<XmlValue>, XPathError> {
+    atomize_at_most_one(value, "zero or one item")
+}
+
+/// [`atomize_to_single_opt`], naming the expected type in the XPTY0004 raised
+/// for more than one item.
+pub(crate) fn atomize_at_most_one<N: DomNavigator>(
+    value: XPathValue<N>,
+    expected: &str,
 ) -> Result<Option<XmlValue>, XPathError> {
     match value {
         XPathValue::Empty => Ok(None),
@@ -653,7 +677,7 @@ pub fn atomize_to_single_opt<N: DomNavigator>(
             if items.len() == 1 {
                 item_at_most_one(items.into_iter().next().unwrap())
             } else {
-                Err(XPathError::more_than_one_item())
+                Err(too_many_items(expected))
             }
         }
     }

@@ -1212,3 +1212,112 @@ fn foch0004_reports_its_code_through_the_error_qname_machinery() {
     assert_eq!(raised.local_name, "FOCH0004");
     assert!(crate::xpath::error::QNAMED_ERROR_CODES.contains(&"FOCH0004"));
 }
+
+// ============================================================================
+// When the comparison operators ask the resolver
+// ============================================================================
+
+/// Review finding X-11. The `CollationResolver` contract says the resolver "is
+/// asked only when a collation is actually needed to compare strings". Under a
+/// host default collation the comparison operators used to resolve it on every
+/// evaluation, numbers included: 1,000 calls for a 1,000-item integer filter.
+/// Now an operator that compares no string never asks, and one that does asks
+/// once per run (the per-run memo).
+#[test]
+fn the_comparison_operators_ask_the_resolver_only_for_strings_and_once_per_run() {
+    // A literal of 80 strings: large enough for the cross-evaluation index
+    // (it is run invariant) and for the bounded pairwise prefix to run out.
+    let strings: Vec<String> = (1..=80).map(|i| format!("'{i}'")).collect();
+    let indexed_strings = format!("count((1 to 300)[string(.) = ({})])", strings.join(", "));
+    let cases: Vec<(String, i64, usize)> = vec![
+        // Numbers only: the resolver is never asked.
+        ("count((1 to 1000)[. = 5])".into(), 1, 0),
+        ("count((1 to 1000)[. != 5])".into(), 999, 0),
+        ("count((1 to 1000)[. < 5])".into(), 4, 0),
+        ("count((1 to 1000)[. <= 5])".into(), 5, 0),
+        ("count((1 to 1000)[. > 995])".into(), 5, 0),
+        ("count((1 to 1000)[. >= 995])".into(), 6, 0),
+        ("count((1 to 1000)[. eq 5])".into(), 1, 0),
+        ("count((1 to 1000)[. lt 5])".into(), 4, 0),
+        ("count((1 to 300)[. = (1 to 80)])".into(), 80, 0),
+        (
+            "count((1 to 1000)[compare(string(.), 'x') = 0])".into(),
+            0,
+            1,
+        ),
+        // Strings: asked once for the whole run, however many evaluations.
+        ("count((1 to 1000)[string(.) = 'x'])".into(), 0, 1),
+        ("count((1 to 1000)[string(.) != 'x'])".into(), 1000, 1),
+        ("count((1 to 1000)[string(.) eq 'x'])".into(), 0, 1),
+        ("count((1 to 1000)[string(.) < 'x'])".into(), 1000, 1),
+        ("count((1 to 1000)[string(.) ge 'x'])".into(), 0, 1),
+        (indexed_strings, 80, 1),
+        // And the answers are still collated.
+        ("count((1 to 10)[('X', 'y') = 'x'])".into(), 10, 1),
+        ("count((1 to 10)['X' eq 'x'])".into(), 10, 1),
+    ];
+    for (src, expected, calls) in cases {
+        let resolver = Recording::default();
+        let result = eval_caseless(&resolver, &src).unwrap_or_else(|err| panic!("{src}: {err}"));
+        assert_eq!(integer(&result), Some(expected), "{src}");
+        assert_eq!(
+            resolver.asked().len(),
+            calls,
+            "{src}: {:?}",
+            resolver.asked()
+        );
+    }
+}
+
+/// Compatibility mode resolves the default collation the same way.
+#[test]
+fn compatibility_mode_comparisons_ask_the_resolver_only_for_strings() {
+    for (src, expected, calls) in [
+        ("count((1 to 1000)[. = 5]) = 1", true, 0),
+        ("count((1 to 1000)[. < 5]) = 4", true, 0),
+        ("count((1 to 1000)[string(.) = 'x']) = 0", true, 1),
+        ("count((1 to 10)['X' = 'x']) = 10", true, 1),
+    ] {
+        let resolver = Recording::default();
+        assert_eq!(
+            eval_compat(&resolver, CASELESS, None, src).unwrap(),
+            Some(expected),
+            "{src}"
+        );
+        assert_eq!(
+            resolver.asked().len(),
+            calls,
+            "{src}: {:?}",
+            resolver.asked()
+        );
+    }
+}
+
+/// The public iterator functions keep their signatures and resolve the default
+/// collation at most once per call — and not at all for numbers.
+#[test]
+fn the_public_general_comparison_functions_resolve_lazily() {
+    use crate::types::value::XmlValue;
+    use crate::xpath::iterator::{VecNodeIterator, XmlItem};
+    use crate::xpath::operators::{general_eq_iter, general_lt_iter, general_ne_iter};
+    let iter = |values: Vec<XmlValue>| -> VecNodeIterator<Nav> {
+        VecNodeIterator::new(values.into_iter().map(XmlItem::Atomic).collect())
+    };
+    let numbers = || iter((0..100).map(|i| XmlValue::integer(i.into())).collect());
+    let strings = || iter(vec![XmlValue::string("X"), XmlValue::string("y")]);
+    let x = || iter(vec![XmlValue::string("x")]);
+
+    let names = NameTable::new();
+    let resolver = Recording::default();
+    let ctx = XPathContext::new(&names)
+        .with_collation_resolver(&resolver)
+        .with_default_collation(CASELESS);
+    assert!(general_eq_iter(&ctx, &numbers(), &numbers()).unwrap());
+    assert!(general_ne_iter(&ctx, &numbers(), &numbers()).unwrap());
+    assert!(general_lt_iter(&ctx, &numbers(), &numbers()).unwrap());
+    assert_eq!(resolver.asked().len(), 0);
+    assert!(general_eq_iter(&ctx, &strings(), &x()).unwrap());
+    assert_eq!(resolver.asked().len(), 1);
+    assert!(general_lt_iter(&ctx, &x(), &strings()).unwrap());
+    assert_eq!(resolver.asked().len(), 2);
+}

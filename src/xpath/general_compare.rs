@@ -440,7 +440,7 @@ fn f64_key(value: f64) -> KeyOutcome<'static> {
 /// The `xs:double` an `xs:untypedAtomic` value is cast to when it meets a
 /// numeric value. This is the same parse the comparison performs.
 fn untyped_as_double(value: &XmlValue) -> Option<f64> {
-    value.to_string_value().trim().parse::<f64>().ok()
+    crate::xpath::cast::parse_xsd_double(&value.to_string_value())
 }
 
 /// Compute the key of `value` in `bucket`.
@@ -463,7 +463,9 @@ fn key_of<'a>(
     collation: CollationRef<'_>,
 ) -> KeyOutcome<'a> {
     match bucket {
-        Bucket::Str => match collation {
+        // A deferred default collation is resolved here, because a string key
+        // is exactly where two strings are about to be compared under it.
+        Bucket::Str => match collation.resolved() {
             CollationRef::Codepoint => KeyOutcome::Found(Key::Str(string_key(value))),
             CollationRef::Custom(collation) => match collation.sort_key(&string_key(value)) {
                 Some(key) => KeyOutcome::Found(Key::Bytes(key)),
@@ -475,6 +477,8 @@ fn key_of<'a>(
             // FOCH0002 belongs to the comparison, not to the index; declining
             // sends the pair to the pairwise loop, which raises it there.
             CollationRef::Unsupported(_) => KeyOutcome::Failed,
+            // `resolved()` never answers `Deferred`.
+            CollationRef::Deferred(_) => KeyOutcome::Failed,
         },
         Bucket::Num(group) => {
             if class == Class::Untyped {

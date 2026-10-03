@@ -87,8 +87,9 @@ pub fn resolve_uri<N: DomNavigator>(
             if is_absolute_uri(&relative) {
                 return Ok(make_any_uri(&relative));
             }
-            // Can't resolve relative against empty string
-            return Err(XPathError::uri_resolution_error(&relative));
+            // The zero-length string is a relative URI reference, which F&O
+            // §8.1 lists among the unsuitable bases: FORG0002.
+            return Err(XPathError::invalid_uri_argument(&b));
         }
         Some(b) => b,
     };
@@ -381,8 +382,26 @@ fn is_valid_uri_reference(uri: &str) -> bool {
 ///
 /// A base URI must have a scheme followed by scheme-specific content.
 /// "http://" alone (scheme + empty authority + empty path) is not a usable base URI.
+///
+/// F&O §8.1: "If $base is not a valid URI according to the rules of the
+/// xs:anyURI data type, if it is not a suitable URI to use as input to the
+/// chosen resolution algorithm (for example, if it is a relative URI reference,
+/// if it is a non-hierarchic URI, or if it contains a fragment identifier), then
+/// an error is raised \[err:FORG0002\]." A hierarchic URI is one whose
+/// scheme-specific part starts with `/` (RFC 3986 `hier-part`: `"//" authority
+/// path-abempty` or `path-absolute`); `mailto:me@example.org` and `urn:x:y` are
+/// not.
 fn is_valid_base_uri(uri: &str) -> bool {
     if !is_valid_uri_reference(uri) || !is_absolute_uri(uri) {
+        return false;
+    }
+    if uri.contains('#') {
+        return false;
+    }
+    if !uri
+        .split_once(':')
+        .is_some_and(|(_, scheme_specific)| scheme_specific.starts_with('/'))
+    {
         return false;
     }
 

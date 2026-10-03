@@ -400,7 +400,9 @@ pub fn string_value_opt(value: Option<&XmlValue>) -> String {
 pub fn to_number(value: &XmlValue) -> f64 {
     match &value.value {
         XmlValueKind::Atomic(atom) => atomic_to_number(atom),
-        XmlValueKind::UntypedAtomic(s) => s.trim().parse().unwrap_or(f64::NAN),
+        XmlValueKind::UntypedAtomic(s) => {
+            crate::xpath::cast::parse_xsd_double(s).unwrap_or(f64::NAN)
+        }
         XmlValueKind::Union(inner) => to_number(inner),
         XmlValueKind::List { .. } => f64::NAN,
     }
@@ -420,7 +422,7 @@ fn atomic_to_number(atom: &XmlAtomicValue) -> f64 {
                 0.0
             }
         }
-        XmlAtomicValue::String(s) => s.trim().parse().unwrap_or(f64::NAN),
+        XmlAtomicValue::String(s) => crate::xpath::cast::parse_xsd_double(s).unwrap_or(f64::NAN),
         _ => f64::NAN,
     }
 }

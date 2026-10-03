@@ -224,40 +224,50 @@ fn check_xpath20_regex_dialect(pattern: &str, flags: &str) -> Result<(), XPathEr
         }
     }
 
-    // With the `x` flag the whitespace characters #x9, #xA, #xD and #x20 are
-    // removed from the pattern before it is parsed, so `( ?:a)` is `(?:a)`.
+    // F&O §7.6.1.1, the `x` flag: "whitespace characters (#x9, #xA, #xD and
+    // #x20) in the regular expression are removed prior to matching with one
+    // exception: whitespace characters within character class expressions
+    // (charClassExpr) are not removed". So the pattern is checked as it reads
+    // *after* that removal: `( ?:a)` is `(?:a)`, and `\ (?` is `\(?` — the
+    // backslash escapes the next character that survives the removal (F&O's
+    // own example: `hello\ sworld` with `x` matches "hello world").
     let ignore_whitespace = flags.contains('x');
+    let is_removed = |c: char| matches!(c, '\u{9}' | '\u{A}' | '\u{D}' | ' ');
 
     let chars: Vec<char> = pattern.chars().collect();
     // `[` opens a character class and, after `-`, a nested subtracted class;
     // inside a class an unescaped `[` or `]` is not allowed otherwise, so a
     // plain depth counter tracks `[a-z-[(?]]` correctly.
     let mut class_depth: usize = 0;
+    // The last character kept outside a class was an unescaped `(`.
+    let mut after_open_paren = false;
     let mut i = 0;
     while i < chars.len() {
-        match chars[i] {
-            // A backslash escapes the character that follows it, so `\(?` is a
-            // literal `(` with a `?` quantifier on it.
+        let c = chars[i];
+        i += 1;
+        if ignore_whitespace && class_depth == 0 && is_removed(c) {
+            continue;
+        }
+        let opened = after_open_paren;
+        after_open_paren = false;
+        match c {
+            // A backslash escapes the character that follows it — under `x`
+            // and outside a class, the next one that is not removed — so `\(?`
+            // is a literal `(` with a `?` quantifier on it.
             '\\' => {
-                i += 2;
-                continue;
+                if ignore_whitespace && class_depth == 0 {
+                    while chars.get(i).is_some_and(|&next| is_removed(next)) {
+                        i += 1;
+                    }
+                }
+                i += 1;
             }
             '[' => class_depth += 1,
             ']' => class_depth = class_depth.saturating_sub(1),
-            '(' if class_depth == 0 => {
-                let mut j = i + 1;
-                if ignore_whitespace {
-                    while matches!(chars.get(j), Some('\u{9}' | '\u{A}' | '\u{D}' | ' ')) {
-                        j += 1;
-                    }
-                }
-                if chars.get(j) == Some(&'?') {
-                    return Err(XPathError::invalid_regex_pattern(pattern));
-                }
-            }
+            '(' if class_depth == 0 => after_open_paren = true,
+            '?' if opened => return Err(XPathError::invalid_regex_pattern(pattern)),
             _ => {}
         }
-        i += 1;
     }
 
     Ok(())
@@ -874,6 +884,43 @@ mod tests {
         ));
         // Without `x` the space is a literal, so the pattern is a plain group.
         assert!(matches_result("a", "( ?:a)", None).is_ok());
+    }
+
+    /// Review finding X-13.1. With `x` the whitespace is removed *before* the
+    /// pattern is interpreted (F&O §7.6.1.1), so in `^\ (?$` the backslash
+    /// escapes the `(`: the pattern is `^\(?$`, an optional literal `(`.
+    /// Whitespace inside a character class is not removed.
+    #[test]
+    fn test_x_flag_whitespace_is_removed_before_escapes_are_read() {
+        let is = |input: &str, pattern: &str, flags: Option<&str>| -> Option<bool> {
+            match matches_result(input, pattern, flags) {
+                Ok(XPathValue::Item(XmlItem::Atomic(v))) => v.as_boolean(),
+                Ok(_) => panic!("{pattern}: not a boolean"),
+                Err(XPathError::FORX0002 { .. }) => None,
+                Err(e) => panic!("{pattern}: {e}"),
+            }
+        };
+        // With `x`.
+        assert_eq!(is("(", r"^\ (?$", Some("x")), Some(true));
+        assert_eq!(is("", r"^\ (?$", Some("x")), Some(true));
+        assert_eq!(is("((", r"^\ (?$", Some("x")), Some(false));
+        assert_eq!(is("(", "^\\\t\n(?$", Some("x")), Some(true));
+        // F&O's own example.
+        assert_eq!(is("hello world", r"hello\ sworld", Some("x")), Some(true));
+        // A class keeps its whitespace and its `(?`.
+        assert_eq!(is("?", "^[ (?]$", Some("x")), Some(true));
+        assert_eq!(is(" ", "^[ (?]$", Some("x")), Some(true));
+        // An unescaped `(` followed by `?` once the whitespace is gone is still
+        // the later dialect.
+        assert_eq!(is("a", r"\\ ( ?:a)", Some("x")), None);
+        assert_eq!(is("a", r"[a] ( ?:a)", Some("x")), None);
+        // `\ a` with `x` is `\a`, which is not an escape at all.
+        assert_eq!(is("a", r"^\ a$", Some("x")), None);
+
+        // Without `x` the space is what the backslash escapes — not a valid
+        // escape — and the `(?` after it is the later dialect.
+        assert_eq!(is("(", r"^\ (?$", None), None);
+        assert_eq!(is("(", r"^\(?$", None), Some(true));
     }
 
     #[test]

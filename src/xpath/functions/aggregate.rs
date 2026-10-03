@@ -56,15 +56,7 @@ pub fn sum<N: DomNavigator>(
         });
     }
 
-    // Accumulate the sum using operators::eval_binary
-    let mut accumulator = promote_for_sum(&values[0])?;
-
-    for value in values.iter().skip(1) {
-        let promoted = promote_for_sum(value)?;
-        accumulator = eval_binary(BinaryOpKind::Add, &accumulator, &promoted)?;
-    }
-
-    Ok(XPathValue::from_atomic(accumulator))
+    Ok(XPathValue::from_atomic(accumulate_sum(&values, "sum")?))
 }
 
 // ============================================================================
@@ -92,13 +84,7 @@ pub fn avg<N: DomNavigator>(
 
     let count = values.len();
 
-    // Accumulate the sum using operators::eval_binary
-    let mut accumulator = promote_for_sum(&values[0])?;
-
-    for value in values.iter().skip(1) {
-        let promoted = promote_for_sum(value)?;
-        accumulator = eval_binary(BinaryOpKind::Add, &accumulator, &promoted)?;
-    }
+    let accumulator = accumulate_sum(&values, "avg")?;
 
     // Divide by count
     let result = numeric_divide(&accumulator, count)?;
@@ -147,9 +133,12 @@ pub fn min<N: DomNavigator>(
     promote_to_common_numeric_type(&mut promoted);
     reject_mixed_comparison_families(&promoted, "min")?;
 
-    // Per XPath 2.0: If sequence contains NaN, return NaN
-    if contains_nan(&promoted) {
-        return Ok(XPathValue::double(f64::NAN));
+    // F&O §15.4.3/§15.4.4: "If the converted sequence contains the value
+    // NaN, the value NaN is returned" — as a value of the type the numbers
+    // were promoted to ("Numeric values are converted to their least common
+    // type"), so `max((xs:float('NaN'), 1))` is an xs:float.
+    if let Some(nan) = promoted.iter().find(|value| is_nan(value)) {
+        return Ok(XPathValue::from_atomic(nan.clone()));
     }
 
     let mut min_value = promoted[0].clone();
@@ -200,9 +189,12 @@ pub fn max<N: DomNavigator>(
     promote_to_common_numeric_type(&mut promoted);
     reject_mixed_comparison_families(&promoted, "max")?;
 
-    // Per XPath 2.0: If sequence contains NaN, return NaN
-    if contains_nan(&promoted) {
-        return Ok(XPathValue::double(f64::NAN));
+    // F&O §15.4.3/§15.4.4: "If the converted sequence contains the value
+    // NaN, the value NaN is returned" — as a value of the type the numbers
+    // were promoted to ("Numeric values are converted to their least common
+    // type"), so `max((xs:float('NaN'), 1))` is an xs:float.
+    if let Some(nan) = promoted.iter().find(|value| is_nan(value)) {
+        return Ok(XPathValue::from_atomic(nan.clone()));
     }
 
     let mut max_value = promoted[0].clone();
@@ -268,6 +260,50 @@ fn is_integer_type(code: XmlTypeCode) -> bool {
 /// type is the operands' own: a sum of `xs:integer`s is an `xs:integer`, not
 /// an `xs:decimal`. A subtype of `xs:integer` is widened to `xs:integer`,
 /// which is what `op:numeric-add` returns for it.
+/// The sum of a non-empty atomized sequence, as `fn:sum` and `fn:avg` define
+/// it: each item converted by [`promote_for_sum`], then added with `op:numeric-add`
+/// or the duration addition.
+///
+/// F&O §15.4.5 (`fn:sum`): "All items in $arg must be numeric or derived from a
+/// single base type. In addition, the type must support addition. Duration
+/// values must either all be xs:yearMonthDuration values or must all be
+/// xs:dayTimeDuration values. … If the above conditions are not met, a type
+/// error is raised \[err:FORG0006\]." §15.4.2 (`fn:avg`) has the same rule. So
+/// a mixture of individually summable types — a number and a duration, or the
+/// two duration types — is FORG0006, not the XPTY0004 the `+` operator itself
+/// would raise for that pair.
+fn accumulate_sum(values: &[XmlValue], function: &str) -> Result<XmlValue, XPathError> {
+    let mut accumulator = promote_for_sum(&values[0])?;
+    let family = sum_family(accumulator.type_code);
+
+    for value in values.iter().skip(1) {
+        let promoted = promote_for_sum(value)?;
+        if sum_family(promoted.type_code) != family {
+            return Err(XPathError::FORG0006 {
+                message: format!(
+                    "fn:{function} requires all items to be numeric, or all xs:yearMonthDuration, \
+                     or all xs:dayTimeDuration; found {:?} and {:?}",
+                    accumulator.type_code, promoted.type_code
+                ),
+            });
+        }
+        accumulator = eval_binary(BinaryOpKind::Add, &accumulator, &promoted)?;
+    }
+
+    Ok(accumulator)
+}
+
+/// What [`accumulate_sum`] requires to be the same for every item: numeric, or
+/// one of the two summable duration types. Called only on values that
+/// [`promote_for_sum`] accepted.
+fn sum_family(code: XmlTypeCode) -> XmlTypeCode {
+    if code.is_numeric() {
+        XmlTypeCode::Double
+    } else {
+        code
+    }
+}
+
 fn promote_for_sum(value: &XmlValue) -> Result<XmlValue, XPathError> {
     match value.type_code {
         XmlTypeCode::Double | XmlTypeCode::Float | XmlTypeCode::Decimal => Ok(value.clone()),
@@ -282,10 +318,11 @@ fn promote_for_sum(value: &XmlValue) -> Result<XmlValue, XPathError> {
         XmlTypeCode::UntypedAtomic => {
             // Promote untyped to double - per XPath 2.0, throw FORG0001 for invalid values
             let s = value.to_string_value();
-            let d: f64 = s.trim().parse().map_err(|_| XPathError::FORG0001 {
-                value: s.clone(),
-                target_type: "xs:double".to_string(),
-            })?;
+            let d =
+                crate::xpath::cast::parse_xsd_double(&s).ok_or_else(|| XPathError::FORG0001 {
+                    value: s.clone(),
+                    target_type: "xs:double".to_string(),
+                })?;
             Ok(XmlValue::double(d))
         }
         _ => Err(XPathError::FORG0006 {
@@ -386,10 +423,11 @@ fn promote_for_comparison(value: &XmlValue) -> Result<XmlValue, XPathError> {
         XmlTypeCode::UntypedAtomic => {
             // Treat as double for min/max - throw FORG0001 for invalid values
             let s = value.to_string_value();
-            let d: f64 = s.trim().parse().map_err(|_| XPathError::FORG0001 {
-                value: s.clone(),
-                target_type: "xs:double".to_string(),
-            })?;
+            let d =
+                crate::xpath::cast::parse_xsd_double(&s).ok_or_else(|| XPathError::FORG0001 {
+                    value: s.clone(),
+                    target_type: "xs:double".to_string(),
+                })?;
             Ok(XmlValue::double(d))
         }
         XmlTypeCode::AnyUri => {
@@ -467,16 +505,14 @@ fn numeric_divide(value: &XmlValue, count: usize) -> Result<XmlValue, XPathError
 }
 
 /// Check if any value in the sequence is NaN.
-fn contains_nan(values: &[XmlValue]) -> bool {
-    values.iter().any(|v| {
-        if let Some(d) = v.as_double() {
-            return d.is_nan();
-        }
-        if let Some(f) = get_float(v) {
-            return f.is_nan();
-        }
-        false
-    })
+fn is_nan(v: &XmlValue) -> bool {
+    if let Some(d) = v.as_double() {
+        return d.is_nan();
+    }
+    if let Some(f) = get_float(v) {
+        return f.is_nan();
+    }
+    false
 }
 
 /// Extract float value from XmlValue.

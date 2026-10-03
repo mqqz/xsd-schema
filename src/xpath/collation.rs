@@ -270,8 +270,20 @@ fn suffixes(s: &str) -> impl Iterator<Item = &str> {
 ///
 /// Installed on the static context with
 /// [`XPathContext::with_collation_resolver`]. It is never asked about
-/// [`CODEPOINT_COLLATION_URI`], which the engine answers itself, and it is
-/// asked only when a collation is actually needed to compare strings.
+/// [`CODEPOINT_COLLATION_URI`], which the engine answers itself, and otherwise
+/// it is asked only where a collation may be needed to compare strings:
+///
+/// * a comparison operator (`eq`, `lt`, `=`, `<`, …) asks for the default
+///   collation the first time it actually compares two strings — never for an
+///   evaluation that compares only numbers, dates or other non-string values;
+/// * a function that takes a `$collation` argument asks when it is called,
+///   for its argument or, without one, for the default collation.
+///
+/// Within one evaluation run the answer is memoised, so a URI used again and
+/// again costs one call per run (a run that alternates between two URIs asks
+/// again at each switch). The general-comparison functions of
+/// [`operators`](crate::xpath::operators), which see only the static context,
+/// ask at most once per call.
 ///
 /// The `Rc` return (rather than a borrowed reference) lets a resolver build a
 /// collation on demand from a parameterised URI — a UCA URI carrying a locale
@@ -362,6 +374,11 @@ pub(crate) enum CollationRef<'c> {
     Custom(&'c dyn Collation),
     /// FOCH0002, if and when two strings are compared.
     Unsupported(&'c str),
+    /// The static context's default collation, not resolved yet: it is
+    /// resolved — through the host resolver — the first time two strings are
+    /// actually compared under it, and never if no string is. See
+    /// [`DeferredDefault`].
+    Deferred(&'c dyn CollationSupplier),
 }
 
 impl std::fmt::Debug for CollationRef<'_> {
@@ -373,16 +390,21 @@ impl std::fmt::Debug for CollationRef<'_> {
             CollationRef::Codepoint => f.write_str("Codepoint"),
             CollationRef::Custom(_) => f.write_str("Custom(<collation>)"),
             CollationRef::Unsupported(uri) => write!(f, "Unsupported({uri:?})"),
+            CollationRef::Deferred(_) => f.write_str("Deferred"),
         }
     }
 }
 
-impl CollationRef<'_> {
-    /// Whether this is the codepoint collation, i.e. whether every string
-    /// comparison is `str::cmp` and no host code is involved.
+impl<'c> CollationRef<'c> {
+    /// The collation itself: a [`Deferred`](CollationRef::Deferred) one is
+    /// resolved now (once — later calls answer from the supplier's cell), every
+    /// other one is returned as it is.
     #[inline]
-    pub(crate) fn is_codepoint(&self) -> bool {
-        matches!(self, CollationRef::Codepoint)
+    pub(crate) fn resolved(self) -> CollationRef<'c> {
+        match self {
+            CollationRef::Deferred(supplier) => supplier.supply(),
+            other => other,
+        }
     }
 
     /// Order two string values under this collation.
@@ -392,6 +414,7 @@ impl CollationRef<'_> {
             CollationRef::Codepoint => Ok(a.cmp(b)),
             CollationRef::Custom(collation) => Ok(collation.compare(a, b)),
             CollationRef::Unsupported(uri) => Err(XPathError::unknown_collation(*uri)),
+            CollationRef::Deferred(supplier) => supplier.supply().compare(a, b),
         }
     }
 
@@ -402,6 +425,7 @@ impl CollationRef<'_> {
             CollationRef::Codepoint => Ok(a == b),
             CollationRef::Custom(collation) => Ok(collation.equals(a, b)),
             CollationRef::Unsupported(uri) => Err(XPathError::unknown_collation(*uri)),
+            CollationRef::Deferred(supplier) => supplier.supply().equals(a, b),
         }
     }
 
@@ -409,11 +433,111 @@ impl CollationRef<'_> {
     /// collation and an unsupported URI — neither of which a collation-unit
     /// operation can be performed with.
     #[inline]
-    pub(crate) fn custom(&self) -> Option<&dyn Collation> {
-        match self {
-            CollationRef::Custom(collation) => Some(*collation),
+    pub(crate) fn custom(&self) -> Option<&'c dyn Collation> {
+        match self.resolved() {
+            CollationRef::Custom(collation) => Some(collation),
             _ => None,
         }
+    }
+}
+
+// ============================================================================
+// The default collation, resolved when it is first needed
+// ============================================================================
+
+/// Something that hands out a collation the first time it is asked for one.
+///
+/// The one implementation is [`DeferredDefault`]; the trait exists so that a
+/// [`CollationRef`] can point at it whatever lifetimes it borrows with.
+pub(crate) trait CollationSupplier {
+    /// The collation, resolved on the first call. Never
+    /// [`CollationRef::Deferred`].
+    fn supply(&self) -> CollationRef<'_>;
+}
+
+/// The static context's default collation for **one comparison**, resolved
+/// only when that comparison actually compares two strings.
+///
+/// The comparison operators do not know what their operands hold until they
+/// compare them: `$i = 5` and `$s = 'x'` are the same operator. Resolving the
+/// default collation up front would ask the host resolver on every evaluation
+/// of every comparison, numbers included — which contradicts the
+/// [`CollationResolver`] contract ("asked only when a collation is actually
+/// needed to compare strings") and makes a resolver that builds a collator per
+/// call pay for it on every integer comparison. Instead the comparison carries
+/// a [`CollationRef::Deferred`] pointing here, and the first string pair
+/// resolves it, once for the whole comparison.
+///
+/// Built with [`with_memo`](Self::with_memo) where a dynamic context is at hand,
+/// the resolution also goes through the per-run memo
+/// ([`resolve_collation_cached`]'s), so the resolver is asked at most once per
+/// run however often the comparison is evaluated. Under the codepoint default —
+/// the overwhelmingly common case — [`as_ref`](Self::as_ref) is
+/// [`CollationRef::Codepoint`] and nothing here is ever touched.
+pub(crate) struct DeferredDefault<'a> {
+    /// The default collation URI; `None` for the codepoint collation.
+    uri: Option<&'a str>,
+    resolver: Option<&'a dyn CollationResolver>,
+    /// The per-run memo, when the caller has a dynamic context.
+    memo: Option<std::cell::RefCell<&'a mut CollationCache>>,
+    resolved: std::cell::OnceCell<ActiveCollation>,
+}
+
+impl<'a> DeferredDefault<'a> {
+    /// The default collation of `context`, resolved without a memo — at most
+    /// once for the lifetime of this value.
+    #[inline]
+    pub(crate) fn new(context: &'a XPathContext<'_>) -> Self {
+        Self {
+            uri: context.default_collation_uri(),
+            resolver: context.collation_resolver(),
+            memo: None,
+            resolved: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The default collation of `context`, resolved through the per-run memo
+    /// `memo` (the dynamic context's).
+    #[inline]
+    pub(crate) fn with_memo(context: &'a XPathContext<'_>, memo: &'a mut CollationCache) -> Self {
+        let uri = context.default_collation_uri();
+        Self {
+            uri,
+            resolver: context.collation_resolver(),
+            memo: uri.map(|_| std::cell::RefCell::new(memo)),
+            resolved: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The handle a comparison takes: the codepoint collation itself, or a
+    /// deferred one that resolves on first use.
+    #[inline]
+    pub(crate) fn as_ref(&self) -> CollationRef<'_> {
+        match self.uri {
+            None => CollationRef::Codepoint,
+            Some(_) => CollationRef::Deferred(self),
+        }
+    }
+}
+
+impl CollationSupplier for DeferredDefault<'_> {
+    fn supply(&self) -> CollationRef<'_> {
+        self.resolved
+            .get_or_init(|| {
+                let Some(uri) = self.uri else {
+                    return ActiveCollation::Codepoint;
+                };
+                let resolver = self.resolver;
+                let ask = || resolver.and_then(|resolver| resolver.resolve(uri));
+                match &self.memo {
+                    Some(memo) => memo.borrow_mut().resolve(uri, ask),
+                    None => match ask() {
+                        Some(collation) => ActiveCollation::Custom(Rc::from(uri), collation),
+                        None => ActiveCollation::Unsupported(Rc::from(uri)),
+                    },
+                }
+            })
+            .as_ref()
     }
 }
 
@@ -421,15 +545,15 @@ impl CollationRef<'_> {
 // Resolution — the one place that turns a URI into a collation
 // ============================================================================
 
-/// The static context's default collation.
+/// The static context's default collation, resolved now.
 ///
-/// The counterpart of [`resolve_collation_cached`] for the call sites that have
-/// only the static context — the general-comparison operators, whose signatures
-/// are public and fixed — and that never take an explicit `$collation`
-/// argument.
+/// The comparison operators do not use this — they carry a
+/// [`DeferredDefault`] and resolve only when two strings meet. It remains for
+/// callers that need the collation whatever the values are.
 ///
 /// `XPathContext` stores an unset default — and an explicit codepoint default —
 /// as `None`, so this is a discriminant test on the hot path.
+#[cfg(test)]
 pub(crate) fn resolve_default(context: &XPathContext<'_>) -> ActiveCollation {
     match context.default_collation_uri() {
         None => ActiveCollation::Codepoint,
@@ -438,6 +562,7 @@ pub(crate) fn resolve_default(context: &XPathContext<'_>) -> ActiveCollation {
 }
 
 /// Ask the host resolver.
+#[cfg(test)]
 fn lookup(context: &XPathContext<'_>, uri: &str) -> ActiveCollation {
     match context
         .collation_resolver()
@@ -589,28 +714,36 @@ pub(crate) struct CollationCache {
 
 impl CollationCache {
     /// What the resolver answers for `uri`, asking it at most once per distinct
-    /// URI in a row.
-    fn get_or_resolve(
+    /// URI in a row — as the collation a call uses, carrying the memo's own
+    /// copy of the URI (so a hit allocates nothing).
+    fn resolve(
         &mut self,
         uri: &str,
         resolve: impl FnOnce() -> Option<Rc<dyn Collation>>,
-    ) -> Option<Rc<dyn Collation>> {
-        if let Some((cached_uri, cached)) = &self.last {
-            if &**cached_uri == uri {
+    ) -> ActiveCollation {
+        let (cached_uri, cached) = match &self.last {
+            Some((cached_uri, cached)) if &**cached_uri == uri => {
                 #[cfg(test)]
                 {
                     self.hits += 1;
                 }
-                return cached.clone();
+                (Rc::clone(cached_uri), cached.clone())
             }
+            _ => {
+                #[cfg(test)]
+                {
+                    self.misses += 1;
+                }
+                let resolved = resolve();
+                let cached_uri: Rc<str> = Rc::from(uri);
+                self.last = Some((Rc::clone(&cached_uri), resolved.clone()));
+                (cached_uri, resolved)
+            }
+        };
+        match cached {
+            Some(collation) => ActiveCollation::Custom(cached_uri, collation),
+            None => ActiveCollation::Unsupported(cached_uri),
         }
-        #[cfg(test)]
-        {
-            self.misses += 1;
-        }
-        let resolved = resolve();
-        self.last = Some((Rc::from(uri), resolved.clone()));
-        resolved
     }
 
     /// How many lookups of this run were answered from the memo.
@@ -628,10 +761,11 @@ impl CollationCache {
 
 /// [`resolve_collation`], memoised in the dynamic context of this run.
 ///
-/// Used by every call site that has a `DynamicContext` — the function library
-/// and the value comparisons. The general-comparison operators see only the
-/// static context (their signatures are public and fixed) and resolve directly;
-/// under the codepoint collation both cost the same `Option::is_none()`.
+/// Used by the function library, which needs the collation of a call whatever
+/// its arguments turn out to be. The comparison operators use a
+/// [`DeferredDefault`] instead, which resolves through the same memo but only
+/// when two strings are compared; under the codepoint collation both cost the
+/// same `Option::is_none()`.
 pub(crate) fn resolve_collation_cached<N: crate::xpath::DomNavigator>(
     context: &mut crate::xpath::context::DynamicContext<'_, N>,
     explicit: Option<&str>,
@@ -655,13 +789,9 @@ pub(crate) fn resolve_collation_cached<N: crate::xpath::DomNavigator>(
     };
 
     let resolver = static_context.collation_resolver();
-    let resolved = context
+    context
         .collation_cache_mut()
-        .get_or_resolve(&uri, || resolver.and_then(|r| r.resolve(&uri)));
-    match resolved {
-        Some(collation) => ActiveCollation::Custom(Rc::from(&*uri), collation),
-        None => ActiveCollation::Unsupported(Rc::from(&*uri)),
-    }
+        .resolve(&uri, || resolver.and_then(|r| r.resolve(&uri)))
 }
 
 #[cfg(test)]

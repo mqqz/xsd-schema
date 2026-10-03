@@ -704,7 +704,7 @@ impl<'input> Lexer<'input> {
     }
 
     /// Consume a numeric literal.
-    fn consume_number(&mut self) -> (Token, usize, usize) {
+    fn consume_number(&mut self) -> Result<(Token, usize, usize), LexerError> {
         let start = self.pos;
         let mut is_decimal = false;
         let mut is_double = false;
@@ -737,7 +737,11 @@ impl<'input> Lexer<'input> {
             }
         }
 
-        // Exponent part
+        // Exponent part. XPath 2.0 §A.2.1:
+        //   DoubleLiteral ::= (("." Digits) | (Digits ("." [0-9]*)?)) [eE] [+-]? Digits
+        // so the exponent needs at least one digit: `1e` and `5.0e+` are not
+        // numeric literals (and a letter straight after a numeric literal is not
+        // a separate token either, §A.2.2), which is a syntax error.
         if let Some(c) = self.current() {
             if c == 'e' || c == 'E' {
                 is_double = true;
@@ -747,12 +751,22 @@ impl<'input> Lexer<'input> {
                         self.advance(1);
                     }
                 }
+                let digits_start = self.pos;
                 while let Some(c) = self.current() {
                     if Self::is_digit(c) {
                         self.advance(1);
                     } else {
                         break;
                     }
+                }
+                if self.pos == digits_start {
+                    let literal: String = self.chars[start..self.pos].iter().collect();
+                    return Err(LexerError {
+                        message: format!(
+                            "Invalid numeric literal '{literal}': the exponent has no digits"
+                        ),
+                        position: start,
+                    });
                 }
             }
         }
@@ -766,7 +780,7 @@ impl<'input> Lexer<'input> {
             Token::IntegerLiteral(value)
         };
 
-        (token, start, self.pos)
+        Ok((token, start, self.pos))
     }
 
     /// Consume a string literal.
@@ -823,7 +837,7 @@ impl<'input> Lexer<'input> {
                     self.advance(2);
                     self.enqueue(Token::DoublePeriod, start, self.pos);
                 } else if self.peek(1).map(Self::is_digit).unwrap_or(false) {
-                    let (tok, s, e) = self.consume_number();
+                    let (tok, s, e) = self.consume_number()?;
                     self.enqueue(tok, s, e);
                 } else {
                     self.advance(1);
@@ -939,7 +953,7 @@ impl<'input> Lexer<'input> {
             }
 
             Some(c) if Self::is_digit(c) => {
-                let (tok, s, e) = self.consume_number();
+                let (tok, s, e) = self.consume_number()?;
                 self.enqueue(tok, s, e);
                 self.state = LexerState::Operator;
             }

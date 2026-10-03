@@ -455,22 +455,90 @@ fn cast_to_double(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPathE
 
 /// Parse a float string, handling special values like INF and NaN.
 fn parse_float_with_special(s: &str) -> Result<f32, ()> {
-    match s {
-        "INF" => Ok(f32::INFINITY),
-        "-INF" => Ok(f32::NEG_INFINITY),
-        "NaN" => Ok(f32::NAN),
-        _ => s.parse::<f32>().map_err(|_| ()),
-    }
+    parse_xsd_float(s).ok_or(())
 }
 
 /// Parse a double string, handling special values like INF and NaN.
 fn parse_double_with_special(s: &str) -> Result<f64, ()> {
+    parse_xsd_double(s).ok_or(())
+}
+
+/// The `xs:double` whose lexical form is `lexical`, or `None` when it is not
+/// one.
+///
+/// The lexical space (XSD 1.1 Part 2 §3.3.5): a decimal mantissa with an
+/// optional sign and an optional exponent, or one of `INF`, `+INF`, `-INF`,
+/// `NaN` — spelled exactly so. Surrounding XML whitespace is collapsed away
+/// first (the type's `whiteSpace` facet is `collapse`). Rust's own `f64` parser
+/// is not used on its own because it also accepts `inf`, `infinity`, `nan`,
+/// `-NaN` and friends in any case; XPath 2.0 Appendix I.1 is explicit that
+/// "the strings Infinity and -Infinity … cause a dynamic error when
+/// compatibility mode is set to false" (and convert to NaN under `fn:number`).
+///
+/// Every conversion of a string or `xs:untypedAtomic` to `xs:double` in the
+/// engine goes through this — `cast`, `fn:number`, arithmetic, comparisons,
+/// `fn:sum`/`fn:avg`/`fn:min`/`fn:max` — so they all agree on what is a number.
+pub(crate) fn parse_xsd_double(lexical: &str) -> Option<f64> {
+    let s = trim_xml_whitespace(lexical);
     match s {
-        "INF" => Ok(f64::INFINITY),
-        "-INF" => Ok(f64::NEG_INFINITY),
-        "NaN" => Ok(f64::NAN),
-        _ => s.parse::<f64>().map_err(|_| ()),
+        "INF" | "+INF" => Some(f64::INFINITY),
+        "-INF" => Some(f64::NEG_INFINITY),
+        "NaN" => Some(f64::NAN),
+        _ if is_xsd_numeral(s) => s.parse().ok(),
+        _ => None,
     }
+}
+
+/// [`parse_xsd_double`] for `xs:float`, which has the same lexical space.
+pub(crate) fn parse_xsd_float(lexical: &str) -> Option<f32> {
+    let s = trim_xml_whitespace(lexical);
+    match s {
+        "INF" | "+INF" => Some(f32::INFINITY),
+        "-INF" => Some(f32::NEG_INFINITY),
+        "NaN" => Some(f32::NAN),
+        _ if is_xsd_numeral(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn trim_xml_whitespace(s: &str) -> &str {
+    s.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
+}
+
+/// Whether `s` is `(\+|-)?([0-9]+(\.[0-9]*)?|\.[0-9]+)([Ee](\+|-)?[0-9]+)?` — the
+/// numeric (non-special) part of the `xs:double` / `xs:float` lexical space.
+fn is_xsd_numeral(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while *i < bytes.len() && bytes[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i - start
+    };
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let integer_digits = digits(&mut i);
+    let mut fraction_digits = 0;
+    if bytes.get(i) == Some(&b'.') {
+        i += 1;
+        fraction_digits = digits(&mut i);
+    }
+    if integer_digits == 0 && fraction_digits == 0 {
+        return false;
+    }
+    if matches!(bytes.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(bytes.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        if digits(&mut i) == 0 {
+            return false;
+        }
+    }
+    i == bytes.len()
 }
 
 /// Treat a value as a specific type (type assertion without conversion).

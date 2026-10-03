@@ -554,35 +554,41 @@ fn get_opt_id(names: &NameTable, s: &str) -> Option<NameId> {
     }
 }
 
-/// Get a node argument, using context item if no argument provided.
-/// Returns None for empty sequence.
+/// Get a `$arg as node()?` argument, using the context item if no argument is
+/// provided. Returns None for the empty sequence.
+///
+/// F&O (e.g. §14.1 `fn:name`): "If the argument is omitted, it defaults to the
+/// context item (.). … The following errors may be raised: if the context item
+/// is undefined \[err:XPDY0002\]; if the context item is not a node
+/// \[err:XPTY0004\]." A supplied argument that is not a `node()?` — an atomic
+/// value, or more than one item — fails the function conversion rules (XPath
+/// 2.0 §3.1.5), which is XPTY0004 as well.
 fn get_node_arg<N: DomNavigator>(
     context: &DynamicContext<'_, N>,
     args: Vec<XPathValue<N>>,
 ) -> Result<Option<N>, XPathError> {
+    let not_a_node = || XPathError::XPTY0004 {
+        expected: "node()?".to_string(),
+        found: "an atomic value".to_string(),
+    };
     if args.is_empty() {
         // Use context item
         match &context.context_item {
             Some(XmlItem::Node(n)) => Ok(Some(n.clone())),
-            Some(XmlItem::Atomic(_)) => {
-                // Non-node context item returns empty for these functions
-                Ok(None)
-            }
+            Some(XmlItem::Atomic(_)) => Err(not_a_node()),
             None => Err(XPathError::XPDY0002 {
                 message: "Context item is absent".to_string(),
             }),
         }
     } else {
-        let items = materialize(args.into_iter().next().unwrap());
-        if items.is_empty() {
-            return Ok(None);
+        let mut items = materialize(args.into_iter().next().unwrap());
+        if items.len() > 1 {
+            return Err(super::too_many_items("node()?"));
         }
-        match &items[0] {
-            XmlItem::Node(n) => Ok(Some(n.clone())),
-            XmlItem::Atomic(_) => {
-                // Non-node returns empty for these functions
-                Ok(None)
-            }
+        match items.pop() {
+            None => Ok(None),
+            Some(XmlItem::Node(n)) => Ok(Some(n)),
+            Some(XmlItem::Atomic(_)) => Err(not_a_node()),
         }
     }
 }

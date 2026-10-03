@@ -4276,6 +4276,84 @@ mod xpath10_compatibility_conversion_tests {
         // not something compatibility mode introduces.
         assert_eq!(off("substring('hello', ())").unwrap(), "");
     }
+
+    /// The error code of an evaluation, or its value.
+    fn outcome(result: Result<String, XPathError>) -> String {
+        match result {
+            Ok(value) => value,
+            Err(err) => format!("error:{}", err.error_code().unwrap_or("?")),
+        }
+    }
+
+    /// Review finding X-03. XPath 2.0 §2.4.3 defines the effective boolean value
+    /// as "the result of applying the fn:boolean function to the value" — "In
+    /// all other cases, fn:boolean raises a type error [err:FORG0006]" — with no
+    /// compatibility-mode exception, and lists "General comparisons, in XPath
+    /// 1.0 compatibility mode" among its users. Compatibility mode changes the
+    /// function conversion rules, arithmetic, general comparisons and the order
+    /// of `and`/`or`; it never makes a sequence of two atomic values `true`.
+    #[test]
+    fn compatibility_mode_keeps_the_xpath20_effective_boolean_value() {
+        let xml = "<doc><a>1</a><a>2</a></doc>";
+        for expr in [
+            "boolean((1,2))",
+            "not((1,2))",
+            "(1,2) and 1",
+            "(1, 2) or false()",
+            "(1,2)[(1,2)]",
+            "/doc/a[(1, 'x')]",
+            "if ((1,2)) then 1 else 0",
+            "some $x in (1) satisfies (1,2)",
+        ] {
+            for compat in [false, true] {
+                assert_eq!(
+                    outcome(eval_on(expr, xml, compat)),
+                    "error:FORG0006",
+                    "{expr} (compatibility mode {compat})"
+                );
+            }
+        }
+        // §3.5.2 rule 1 takes the *effective boolean value* of the operand
+        // compared with a boolean: FORG0006 for two atomic values. (Without the
+        // flag the comparison itself is XPTY0004, integer against boolean.)
+        for expr in ["(1,2) = true()", "true() != (1, 2)", "(1,2) < true()"] {
+            assert_eq!(
+                outcome(eval_on(expr, xml, true)),
+                "error:FORG0006",
+                "{expr}"
+            );
+            assert_eq!(
+                outcome(eval_on(expr, xml, false)),
+                "error:XPTY0004",
+                "{expr}"
+            );
+        }
+        // What compatibility mode does change stays changed: a single boolean
+        // operand converts the other operand by its effective boolean value
+        // (§3.5.2) — for a node sequence, an empty sequence, a string, a number…
+        for (expr, expected) in [
+            ("/doc/a = true()", "true"),
+            ("/doc/none = true()", "false"),
+            ("/doc/none = false()", "true"),
+            ("'abc' = true()", "true"),
+            ("0 = false()", "true"),
+            ("1 != true()", "false"),
+            // … and then `<` … `>=` compare the two as numbers (§3.5.2 rule
+            // 3): "true() > number('0.5') is … false in XPath 2.0 even when
+            // compatibility mode is set to true" (Appendix I.1).
+            ("true() > number('0.5')", "false"),
+            ("true() > false()", "true"),
+            // A node sequence's effective boolean value is fine with any
+            // number of nodes.
+            ("boolean(/doc/a)", "true"),
+            ("not(/doc/a)", "false"),
+            ("/doc/a and 1", "true"),
+            ("count(/doc/a[/doc/a])", "2"),
+            ("boolean(('', 1))", "error:FORG0006"),
+        ] {
+            assert_eq!(outcome(eval_on(expr, xml, true)), expected, "{expr}");
+        }
+    }
 }
 
 /// Helper for the expression-level tests below: compile and evaluate `expr`
@@ -5025,10 +5103,8 @@ mod list_atomization_tests {
                 ("max(/doc/@n)", "3"),
                 ("sum(/doc/sc)", "9"),
                 ("distinct-values(/doc/@l)", "a|b"),
-                // (`index-of` compares a derived string type with an
-                // `xs:string` structurally, a separate defect, so the search
-                // value is an `xs:ID` here.)
                 ("index-of(/doc/@l, xs:ID('b'))", "2"),
+                ("index-of(/doc/@l, 'b')", "2"),
                 ("index-of(/doc/@n, 3)", "3"),
                 ("string-join(data(/doc/@l), ',')", "a,b"),
                 ("some $x in data(/doc/@n) satisfies $x eq 2", "true"),
@@ -5179,5 +5255,606 @@ mod list_atomization_tests {
             ],
             false,
         );
+    }
+
+    /// Review finding X-07, on typed values: `fn:index-of` and
+    /// `fn:distinct-values` compare under the rules of `eq` (F&O §15.1.5,
+    /// §15.1.6), so the members of an `xs:NMTOKENS` or `xs:ID`-list value —
+    /// `xs:NMTOKEN`s, `xs:ID`s — equal the `xs:string`s they spell. F&O's own
+    /// example: "If @a is an attribute of type xs:NMTOKENS whose string value is
+    /// "red green blue" … then fn:index-of(@a, "blue") returns 3".
+    #[test]
+    fn index_of_and_distinct_values_see_list_members_as_strings() {
+        check(
+            &[
+                ("index-of(/doc/l, 'q')", "2"),
+                ("index-of(/doc/l, 'p')", "1"),
+                ("index-of(/doc/@l, 'a')", "1"),
+                ("index-of(data(/doc/@l), 'b')", "2"),
+                ("index-of(/doc/@n, 2)", "2"),
+                ("distinct-values((data(/doc/l), 'p'))", "p|q"),
+                ("count(distinct-values((data(/doc/@l), 'a', 'b')))", "2"),
+                ("distinct-values((data(/doc/@l), data(/doc/l)))", "a|b|p|q"),
+            ],
+            false,
+        );
+    }
+}
+
+/// Regression tests for the findings of the 0.2.1 pre-release review of the
+/// XPath engine (the `X-nn` numbers are the review's).
+mod release_review_tests {
+    use crate::namespace::table::NameTable;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::iterator::XmlItem;
+    use crate::xpath::{RoXmlNavigator, XPathContext};
+
+    /// Evaluate `expr` (over `xml` when given) with `xs` bound. A result is its
+    /// items' string values joined by `|`, `()` for the empty sequence,
+    /// `<node>` for a node, and `error:CODE` for an error.
+    fn run_on(expr: &str, xml: Option<&str>) -> String {
+        let names = NameTable::new();
+        let mut namespaces = crate::namespace::context::NamespaceContextSnapshot::default();
+        namespaces.bindings.push((
+            names.add("xs"),
+            names.add("http://www.w3.org/2001/XMLSchema"),
+        ));
+        let ctx = XPathContext::new(&names).with_namespaces(namespaces);
+        let code = |e: crate::xpath::XPathError| {
+            format!(
+                "error:{}",
+                e.error_code()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("<no code> {e}"))
+            )
+        };
+        let compiled = match XPathExpr::compile(expr, &ctx) {
+            Ok(compiled) => compiled,
+            Err(e) => return code(e),
+        };
+        let result = match xml {
+            Some(xml) => {
+                let doc = roxmltree::Document::parse(xml).expect("parse xml");
+                compiled
+                    .evaluator(&ctx)
+                    .run_with_node(RoXmlNavigator::new(&doc))
+                    .map(|value| render(value.into_vec()))
+            }
+            None => compiled
+                .evaluator(&ctx)
+                .run::<RoXmlNavigator<'static>>()
+                .map(|value| render(value.into_vec())),
+        };
+        result.unwrap_or_else(code)
+    }
+
+    fn render<N: crate::xpath::DomNavigator>(items: Vec<XmlItem<N>>) -> String {
+        if items.is_empty() {
+            return "()".to_string();
+        }
+        items
+            .iter()
+            .map(|item| match item {
+                XmlItem::Atomic(v) => v.to_string_value(),
+                XmlItem::Node(_) => "<node>".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// Check every `(expression, expected)` pair and report all mismatches.
+    fn check_on(xml: Option<&str>, cases: &[(&str, &str)]) {
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|(expr, expected)| {
+                let got = run_on(expr, xml);
+                (got != *expected).then(|| format!("{expr}  =>  {got}   (expected {expected})"))
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "{} of {} cases wrong:\n{}",
+            wrong.len(),
+            cases.len(),
+            wrong.join("\n")
+        );
+    }
+
+    fn check(cases: &[(&str, &str)]) {
+        check_on(None, cases);
+    }
+
+    /// X-10. F&O §15.4.5 (`fn:sum`): "Duration values must either all be
+    /// xs:yearMonthDuration values or must all be xs:dayTimeDuration values. …
+    /// If the above conditions are not met, a type error is raised
+    /// [err:FORG0006]." §15.4.2 (`fn:avg`) says the same.
+    #[test]
+    fn sum_and_avg_of_a_type_mixture_are_forg0006() {
+        check(&[
+            ("sum((xs:dayTimeDuration('P1D'), 1))", "error:FORG0006"),
+            ("sum((1, xs:dayTimeDuration('P1D')))", "error:FORG0006"),
+            ("avg((xs:dayTimeDuration('P1D'), 1))", "error:FORG0006"),
+            (
+                "avg((xs:yearMonthDuration('P1Y'), xs:dayTimeDuration('P1D')))",
+                "error:FORG0006",
+            ),
+            (
+                "sum((xs:yearMonthDuration('P1Y'), xs:dayTimeDuration('P1D')))",
+                "error:FORG0006",
+            ),
+            (
+                "sum((xs:dayTimeDuration('P1D'), xs:untypedAtomic('1')))",
+                "error:FORG0006",
+            ),
+            (
+                "sum((xs:duration('P1Y'), xs:duration('P1Y')))",
+                "error:FORG0006",
+            ),
+            ("sum(('a', 1))", "error:FORG0006"),
+            // What is allowed stays allowed: any mixture of numeric types, and
+            // a single duration type.
+            ("sum((1, 2.5, xs:float(1), 1e0))", "5.5"),
+            ("sum((xs:untypedAtomic('1'), 2))", "3"),
+            (
+                "sum((xs:dayTimeDuration('P1D'), xs:dayTimeDuration('PT12H')))",
+                "P1DT12H",
+            ),
+            (
+                "avg((xs:yearMonthDuration('P1Y'), xs:yearMonthDuration('P2Y')))",
+                "P1Y6M",
+            ),
+            ("avg((1, 2, 3))", "2"),
+        ]);
+    }
+
+    /// F2 (document API review). XPath 2.0 §3.2: a leading `/` is
+    /// `(fn:root(self::node()) treat as document-node())/`, and "if the root node
+    /// above the context node is not a document node, a dynamic error is raised
+    /// [err:XPDY0050]" — the same for `//`. Under `BufferDocNavigator::new_orphan`
+    /// with an element, the root is that element. An assertion navigator's root
+    /// is the (hidden) document node, so it keeps answering `/` and `//` — with
+    /// the empty sequence below it, which the W3C suite requires.
+    #[test]
+    fn a_leading_slash_under_a_parentless_element_is_xpdy0050() {
+        use crate::document::{BufferDocNavigator, BufferDocument};
+        let arena = bumpalo::Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(
+            b"<holder><kid><d1/><d2>t</d2></kid></holder>".as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+        let holder = doc.root() + 1;
+        let kid = doc.first_content_child_of(holder).unwrap();
+        let ctx = XPathContext::new(&names);
+        let run = |nav: BufferDocNavigator<'_>, expr: &str| -> String {
+            let code =
+                |e: crate::xpath::XPathError| format!("error:{}", e.error_code().unwrap_or("?"));
+            match XPathExpr::compile(expr, &ctx) {
+                Err(e) => code(e),
+                Ok(compiled) => compiled
+                    .evaluator(&ctx)
+                    .run_with_node(nav)
+                    .map(|value| render(value.into_vec()))
+                    .unwrap_or_else(code),
+            }
+        };
+        for expr in [
+            "count(/)",
+            "count(//d2)",
+            "count(//node())",
+            "/kid",
+            "exists(/)",
+        ] {
+            assert_eq!(
+                run(BufferDocNavigator::new_orphan(&doc, kid), expr),
+                "error:XPDY0050",
+                "{expr} under an orphan element"
+            );
+        }
+        // What does not go through `/` is unaffected.
+        assert_eq!(
+            run(BufferDocNavigator::new_orphan(&doc, kid), "count(root())"),
+            "1"
+        );
+        assert_eq!(
+            run(BufferDocNavigator::new_orphan(&doc, kid), "name(root())"),
+            "kid"
+        );
+        assert_eq!(
+            run(
+                BufferDocNavigator::new_orphan(&doc, kid),
+                "count(descendant::node())"
+            ),
+            "3"
+        );
+        // An assertion navigator: `/` is its document node, `//` is empty.
+        assert_eq!(
+            run(BufferDocNavigator::new_assertion(&doc, kid), "count(/)"),
+            "1"
+        );
+        assert_eq!(
+            run(BufferDocNavigator::new_assertion(&doc, kid), "count(//d2)"),
+            "0"
+        );
+        // An ordinary navigator.
+        assert_eq!(run(BufferDocNavigator::new(&doc, kid), "count(//d2)"), "1");
+        assert_eq!(
+            run(BufferDocNavigator::new(&doc, kid), "name(/*)"),
+            "holder"
+        );
+    }
+
+    /// X-02. XPath 2.0 §3.10.2 / §3.10.3: "In addition, the target type cannot
+    /// be xs:NOTATION or xs:anyAtomicType [err:XPST0080]" — a static error,
+    /// raised when the expression is compiled. Both stay legal in `instance of`
+    /// and `treat as`, where they are ordinary atomic types.
+    #[test]
+    fn cast_to_notation_or_any_atomic_type_is_xpst0080() {
+        use crate::xpath::error::{XPathError, XQT_ERRORS_NAMESPACE};
+        let names = NameTable::new();
+        let mut namespaces = crate::namespace::context::NamespaceContextSnapshot::default();
+        namespaces.bindings.push((
+            names.add("xs"),
+            names.add("http://www.w3.org/2001/XMLSchema"),
+        ));
+        let ctx = XPathContext::new(&names).with_namespaces(namespaces);
+        for expr in [
+            "'a' castable as xs:NOTATION",
+            "1 castable as xs:anyAtomicType",
+            "1 cast as xs:NOTATION",
+            "1 cast as xs:anyAtomicType?",
+            "() cast as xs:NOTATION?",
+            // Static: raised even where the cast is never evaluated.
+            "if (true()) then 1 else (1 cast as xs:anyAtomicType)",
+        ] {
+            let err = match XPathExpr::compile(expr, &ctx) {
+                Ok(_) => panic!("{expr}: compiled, expected XPST0080"),
+                Err(err) => err,
+            };
+            assert_eq!(err.error_code(), Some("XPST0080"), "{expr}: {err}");
+            let raised = err.raised_error().expect("an error QName");
+            assert_eq!(raised.namespace_uri, XQT_ERRORS_NAMESPACE);
+            assert!(!matches!(err, XPathError::XPST0051 { .. }));
+        }
+        check(&[
+            ("1 instance of xs:anyAtomicType", "true"),
+            ("'a' instance of xs:NOTATION", "false"),
+            ("1 treat as xs:anyAtomicType", "1"),
+            ("'1' cast as xs:integer", "1"),
+            ("'a' castable as xs:QName", "true"),
+            // Not a type in the in-scope schema types at all: still XPST0051.
+            ("1 cast as xs:IDREFS", "error:XPST0051"),
+        ]);
+    }
+
+    /// X-07. F&O §15.1.5 (`fn:index-of`): "The items in the sequence
+    /// $seqParam are compared with $srchParam under the rules for the eq
+    /// operator. Values of type xs:untypedAtomic are compared as if they were
+    /// of type xs:string. Values that cannot be compared, i.e. the eq operator
+    /// is not defined for their types, are considered to be distinct." §15.1.6
+    /// (`fn:distinct-values`) the same, with NaN equal to NaN.
+    #[test]
+    fn index_of_and_distinct_values_compare_with_eq() {
+        check(&[
+            ("index-of(xs:token('a'), 'a')", "1"),
+            ("index-of(xs:ID('b'), 'b')", "1"),
+            ("index-of(('a', xs:NCName('a'), xs:anyURI('a')), 'a')", "1|2|3"),
+            ("count(distinct-values((xs:token('a'), 'a')))", "1"),
+            ("count(distinct-values((xs:untypedAtomic('a'), 'a', xs:anyURI('a'))))", "1"),
+            ("index-of((xs:untypedAtomic('a'), 'a'), 'a')", "1|2"),
+            // Untyped is a string here, not a number.
+            ("index-of((1, 2, 3), xs:untypedAtomic('2'))", "()"),
+            // Numeric promotion.
+            ("index-of((1, 2.0, 2e0, xs:float(2), 3), 2)", "2|3|4"),
+            // Incomparable pairs are unequal, not errors.
+            ("index-of(('a', 1, 'b', true()), 1)", "2"),
+            ("count(distinct-values(('1', 1, true(), xs:date('2000-01-01'))))", "4"),
+            // Dates and times by their point on the timeline.
+            (
+                "index-of((xs:dateTime('2000-01-01T12:00:00Z'), \
+                 xs:dateTime('2000-01-01T13:00:00+01:00')), xs:dateTime('2000-01-01T12:00:00Z'))",
+                "1|2",
+            ),
+            // Durations across their subtypes.
+            (
+                "count(distinct-values((xs:yearMonthDuration('P12M'), xs:yearMonthDuration('P1Y'), \
+                 xs:dayTimeDuration('PT0S'), xs:yearMonthDuration('P0M'))))",
+                "2",
+            ),
+            // QNames by expanded name.
+            ("index-of(QName('urn:x', 'p:a'), QName('urn:x', 'q:a'))", "1"),
+            // NaN: never `eq`, but one distinct value.
+            ("index-of(xs:double('NaN'), xs:double('NaN'))", "()"),
+            ("count(distinct-values((xs:double('NaN'), xs:float('NaN'), 0e0 div 0)))", "1"),
+        ]);
+    }
+
+    /// X-08. XPath 2.0 §3.1.5: "If, after the above conversions, the resulting
+    /// value does not match the expected type according to the rules for
+    /// SequenceType Matching, a type error is raised [err:XPTY0004]"; §3.5.3:
+    /// each operand of `is`, `<<`, `>>` "must be either a single node or an
+    /// empty sequence; otherwise a type error is raised [err:XPTY0004]".
+    /// XPDY0050 is `treat as`'s code.
+    #[test]
+    fn a_built_in_argument_of_the_wrong_cardinality_is_xpty0004() {
+        let xml = "<doc><a><b/></a><a><b/></a></doc>";
+        check_on(
+            Some(xml),
+            &[
+                ("upper-case(('a','b'))", "error:XPTY0004"),
+                ("abs((1,2))", "error:XPTY0004"),
+                ("string-length(('a','b'))", "error:XPTY0004"),
+                ("concat(('a','b'),'c')", "error:XPTY0004"),
+                ("number((1,2))", "error:XPTY0004"),
+                ("round(/doc/a)", "error:XPTY0004"),
+                ("compare(('a','b'),'a')", "error:XPTY0004"),
+                ("string-join(('a','b'),('x','y'))", "error:XPTY0004"),
+                (
+                    "year-from-date((xs:date('2000-01-01'), xs:date('2001-01-01')))",
+                    "error:XPTY0004",
+                ),
+                // `node()?` parameters.
+                ("name(/doc/a)", "error:XPTY0004"),
+                ("root((/doc, /doc/a))", "error:XPTY0004"),
+                ("local-name(1)", "error:XPTY0004"),
+                ("(1, 2)[name() = '']", "error:XPTY0004"),
+                // Node comparisons.
+                ("/doc/a is /doc/a[1]", "error:XPTY0004"),
+                ("/doc/a[1] << /doc/a", "error:XPTY0004"),
+                // `treat as` keeps XPDY0050.
+                ("(1, 2) treat as xs:integer", "error:XPDY0050"),
+                // What is allowed stays allowed.
+                ("upper-case(())", ""),
+                ("name(/doc/none)", ""),
+                ("name(/doc/a[1])", "a"),
+                ("/doc/a[1] is /doc/a[1]", "true"),
+                ("count(/doc/a[1] is ())", "0"),
+                ("string-join(('a','b'), ',')", "a,b"),
+            ],
+        );
+    }
+
+    /// X-12. XPath 2.0 §3.4: "If the atomized operand is of type
+    /// xs:untypedAtomic, it is cast to xs:double. If the cast fails, a dynamic
+    /// error is raised. [err:FORG0001]" and "If the types of the operands, after
+    /// evaluation, are not a valid combination for the given operator, according
+    /// to the rules in B.2 Operator Mapping, a type error is raised
+    /// [err:XPTY0004]"; B.2 maps unary `+` to `op:numeric-unary-plus($arg as
+    /// numeric)`, whose result F&O §6.2.7 makes "an instance of xs:integer,
+    /// xs:decimal, xs:double, or xs:float depending on the type of $arg".
+    #[test]
+    fn unary_plus_is_numeric_like_unary_minus() {
+        check_on(
+            Some("<doc><a>x</a><n>3</n></doc>"),
+            &[
+                ("+'3'", "error:XPTY0004"),
+                ("+true()", "error:XPTY0004"),
+                ("+xs:date('2000-01-01')", "error:XPTY0004"),
+                ("+xs:untypedAtomic('3') instance of xs:double", "true"),
+                ("+xs:untypedAtomic('3')", "3"),
+                ("+/doc/n instance of xs:double", "true"),
+                ("+/doc/a", "error:FORG0001"),
+                ("+()", "()"),
+                ("+(1, 2)", "error:XPTY0004"),
+                ("+3", "3"),
+                ("+3 instance of xs:integer", "true"),
+                ("+xs:short(3) instance of xs:integer", "true"),
+                ("+xs:short(3) instance of xs:short", "false"),
+                ("+1.5 instance of xs:decimal", "true"),
+                ("+xs:float(2) instance of xs:float", "true"),
+                ("+-2", "-2"),
+                // Unary minus, for comparison.
+                ("-'3'", "error:XPTY0004"),
+                ("-/doc/a", "error:FORG0001"),
+            ],
+        );
+    }
+
+    /// Check `(expression, expected)` pairs over `instance`, validated against
+    /// `schema`, with the schema set in the static context.
+    fn check_typed(schema: &str, instance: &str, cases: &[(&str, &str)]) {
+        use crate::document::typed_builder::build_typed_document;
+        use crate::document::BufferDocumentOptions;
+        let mut schema_set = crate::schema::SchemaSet::xsd11();
+        crate::pipeline::load_and_process_schema(schema.as_bytes(), "t.xsd", &mut schema_set, None)
+            .expect("the fixture schema loads");
+        let arena = bumpalo::Bump::new();
+        let doc = build_typed_document(
+            instance.as_bytes(),
+            &arena,
+            &schema_set,
+            BufferDocumentOptions::default(),
+        )
+        .expect("the fixture document is built");
+        let mut namespaces = crate::namespace::context::NamespaceContextSnapshot::default();
+        namespaces.bindings.push((
+            schema_set.name_table.add("xs"),
+            schema_set
+                .name_table
+                .add("http://www.w3.org/2001/XMLSchema"),
+        ));
+        let ctx = XPathContext::new(&schema_set.name_table)
+            .with_namespaces(namespaces)
+            .with_schema_set(&schema_set);
+        let code = |e: crate::xpath::XPathError| format!("error:{}", e.error_code().unwrap_or("?"));
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|(expr, expected)| {
+                let got = match XPathExpr::compile(expr, &ctx) {
+                    Err(e) => code(e),
+                    Ok(compiled) => compiled
+                        .evaluator(&ctx)
+                        .run_with_node(doc.create_navigator())
+                        .map(|value| {
+                            let items = value.into_vec();
+                            if items.is_empty() {
+                                return "()".to_string();
+                            }
+                            items
+                                .iter()
+                                .map(|item| match item {
+                                    XmlItem::Atomic(v) => v.to_string_value(),
+                                    XmlItem::Node(n) => {
+                                        use crate::xpath::DomNavigator;
+                                        n.local_name().to_string()
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("|")
+                        })
+                        .unwrap_or_else(code),
+                };
+                (got != *expected).then(|| format!("{expr}  =>  {got}   (expected {expected})"))
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "{} of {} cases wrong:\n{}",
+            wrong.len(),
+            cases.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// X-04. XPath 2.0 §2.5.4.3: "element(*, TypeName) matches an element node
+    /// regardless of its name, if derives-from(AT, TypeName) is true … and the
+    /// nilled property of the node is false"; "TypeName must be present in the
+    /// in-scope schema types [err:XPST0008]"; §2.5.4.5 for attributes. A step
+    /// `element(N, T)` now selects exactly what `instance of element(N, T)`
+    /// accepts.
+    #[test]
+    fn a_typed_element_or_attribute_step_honours_the_type_name() {
+        const SCHEMA: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+          <xs:complexType name="ct"><xs:sequence><xs:element name="i" type="xs:string"/></xs:sequence></xs:complexType>
+          <xs:element name="doc">
+            <xs:complexType>
+              <xs:sequence>
+                <xs:element name="n" type="xs:integer"/>
+                <xs:element name="s" type="xs:string"/>
+                <xs:element name="z" type="xs:integer" nillable="true"/>
+                <xs:element name="c" type="ct"/>
+              </xs:sequence>
+              <xs:attribute name="a" type="xs:integer"/>
+              <xs:attribute name="b" type="xs:string"/>
+            </xs:complexType>
+          </xs:element>
+        </xs:schema>"#;
+        const INSTANCE: &str = concat!(
+            r#"<doc a="1" b="x" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#,
+            r#"<n>1</n><s>x</s><z xsi:nil="true"/><c><i>t</i></c></doc>"#
+        );
+        check_typed(
+            SCHEMA,
+            INSTANCE,
+            &[
+                ("/doc/element(*, xs:integer)", "n"),
+                ("/doc/element(*, xs:integer?)", "n|z"),
+                ("/doc/s/self::element(*, xs:integer)", "()"),
+                ("/doc/z/self::element(*, xs:integer)", "()"),
+                ("/doc/element(s, xs:integer)", "()"),
+                ("/doc/element(s, xs:string)", "s"),
+                ("/doc/element(*, xs:decimal)", "n"),
+                ("/doc/element(*, ct)", "c"),
+                ("/doc/element(*, xs:anyType)", "n|s|c"),
+                ("/doc/element(*, xs:anyType?)", "n|s|z|c"),
+                ("/doc/attribute(*, xs:integer)", "a"),
+                ("/doc/attribute(*, xs:anySimpleType)", "a|b"),
+                ("/doc/@attribute(b, xs:string)", "b"),
+                ("/doc/element(*, xs:integer)[1]", "n"),
+                ("count(/doc/element(*, xs:string)[last()])", "1"),
+                ("/document-node(element(doc, xs:integer))", "()"),
+                ("count(/self::document-node(element(doc)))", "1"),
+                // The step and `instance of` agree.
+                ("/doc/s instance of element(*, xs:integer)", "false"),
+                ("/doc/z instance of element(*, xs:integer)", "false"),
+                ("/doc/n instance of element(*, xs:integer)", "true"),
+                // Unknown type names.
+                ("/doc/element(*, nosuchtype)", "error:XPST0008"),
+                (
+                    "/doc/n instance of element(*, nosuchtype)",
+                    "error:XPST0008",
+                ),
+                ("/doc/attribute(*, xs:nosuchtype)", "error:XPST0008"),
+            ],
+        );
+        // Untyped: only xs:untyped / xs:anyType (elements) and the untyped
+        // atomic names (attributes) match, in a step as in `instance of`.
+        check_on(
+            Some(r#"<doc a="1"><n>1</n></doc>"#),
+            &[
+                ("count(/doc/element(*, xs:integer))", "0"),
+                ("count(/doc/attribute(*, xs:integer))", "0"),
+                ("count(/doc/element(*, xs:untyped))", "1"),
+                ("count(/doc/attribute(*, xs:untypedAtomic))", "1"),
+                ("/doc/n instance of element(*, xs:integer)", "false"),
+                // Without a schema set only the built-in types are in scope.
+                ("/doc/element(*, my-type)", "error:XPST0008"),
+            ],
+        );
+    }
+
+    /// X-13, the small items.
+    #[test]
+    fn minor_review_items() {
+        check(&[
+            // 13.9 — F&O §6.2.5: "If either operand is NaN or if $arg1 is INF
+            // or -INF then an error is raised [err:FOAR0002]"; a zero divisor
+            // is FOAR0001; an infinite divisor gives zero.
+            ("xs:float('INF') idiv 1", "error:FOAR0002"),
+            ("xs:double('-INF') idiv 1", "error:FOAR0002"),
+            ("xs:double('NaN') idiv 1", "error:FOAR0002"),
+            ("1 idiv xs:double('NaN')", "error:FOAR0002"),
+            ("1e0 idiv 0", "error:FOAR0001"),
+            ("xs:float(1) idiv xs:float(0)", "error:FOAR0001"),
+            ("1e0 idiv xs:double('INF')", "0"),
+            ("-7e0 idiv 2", "-3"),
+            ("xs:float(31) idiv xs:float(7)", "4"),
+            // A quotient beyond i64 is still exact.
+            ("1e20 idiv 1", "100000000000000000000"),
+            // 13.3 — XPath 2.0 A.2.1: DoubleLiteral needs exponent digits.
+            ("1e", "error:XPST0003"),
+            ("5.0e", "error:XPST0003"),
+            ("1e+", "error:XPST0003"),
+            ("1e1", "10"),
+            (".5E-1", "0.05"),
+            // 13.4 — only the XSD lexical forms; `inf`, `Infinity`, `nan` are
+            // not numbers (XPath 2.0 Appendix I.1).
+            ("xs:double('inf')", "error:FORG0001"),
+            ("xs:double('Infinity')", "error:FORG0001"),
+            ("xs:float('-inf')", "error:FORG0001"),
+            ("xs:double('nan')", "error:FORG0001"),
+            ("xs:double('-NaN')", "error:FORG0001"),
+            ("xs:double(' INF ')", "INF"),
+            ("xs:double('-INF')", "-INF"),
+            ("xs:double('NaN')", "NaN"),
+            ("xs:double('+1.e2')", "100"),
+            ("number('inf')", "NaN"),
+            ("number('Infinity')", "NaN"),
+            ("number('INF')", "INF"),
+            ("xs:untypedAtomic('Infinity') + 1", "error:FORG0001"),
+            ("xs:untypedAtomic('inf') = 1", "error:FORG0001"),
+            ("'inf' castable as xs:double", "false"),
+            ("sum(xs:untypedAtomic('inf'))", "error:FORG0001"),
+            // 13.2 — F&O §15.4.3/§15.4.4: the NaN returned is of the least
+            // common type of the numbers.
+            ("max((xs:float('NaN'), 1)) instance of xs:float", "true"),
+            ("min((1, xs:float('NaN'))) instance of xs:float", "true"),
+            (
+                "max((xs:double('NaN'), xs:float(1))) instance of xs:double",
+                "true",
+            ),
+            ("string(max((xs:float('NaN'), 1)))", "NaN"),
+            // 13.7 — F&O §8.1: a base that is a relative reference, is not
+            // hierarchic, or has a fragment identifier is FORG0002.
+            ("resolve-uri('a', 'http://x/#f')", "error:FORG0002"),
+            ("resolve-uri('a', 'mailto:me@x.org')", "error:FORG0002"),
+            ("resolve-uri('', '')", "error:FORG0002"),
+            ("resolve-uri('a', 'rel/base')", "error:FORG0002"),
+            ("resolve-uri('a', 'http://x/b/c')", "http://x/b/a"),
+            ("resolve-uri('a', 'file:///d/e')", "file:///d/a"),
+            ("resolve-uri('http://y/z', '')", "http://y/z"),
+        ]);
     }
 }

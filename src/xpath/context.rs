@@ -6,6 +6,8 @@
 //! - `VarStore` - Variable storage (Vec-based arena indexed by VarSlotId)
 //! - `NameBinder` - Compile-time variable slot allocation
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::ids::NameId;
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::QualifiedName;
@@ -194,13 +196,17 @@ impl<'a> XPathContext<'a> {
     /// XPath 2.0 syntax and changes only the *semantics* that XPath 2.0 itself
     /// defines differently when the flag is true:
     ///
-    /// * the effective boolean value of a sequence of more than one item
-    ///   follows the 1.0 rules instead of raising `FORG0006` — this covers
-    ///   `and`, `or` and predicates;
     /// * the operands of `+`, `-`, `*`, `div` and `mod` are converted with the
     ///   1.0 number rules;
-    /// * general comparisons (`=`, `!=`, `<`, …) use the 1.0 node-set rules,
-    ///   including the node-set-versus-boolean case.
+    /// * general comparisons (`=`, `!=`, `<`, …) follow the compatibility
+    ///   rules of XPath 2.0 §3.5.2: an operand compared with a single boolean is
+    ///   converted to its effective boolean value, and `<`, `<=`, `>`, `>=`
+    ///   compare with `fn:number`;
+    /// * an argument whose declared type is a single item takes the first item
+    ///   of the supplied sequence (the function conversion rules of §3.1.5).
+    ///
+    /// The effective boolean value itself is not affected: a sequence of two or
+    /// more atomic values is `FORG0006` with the flag as without it (§2.4.3).
     ///
     /// Hosts embedding the XPath engine need this when they must run
     /// expressions written for a 1.0-era host language while still accepting
@@ -539,7 +545,7 @@ impl NameBinder {
 ///
 /// Stores variable values indexed by VarSlotId.
 /// Size is determined by NameBinder::len() after binding.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VarStore<V> {
     /// Variable values indexed by slot ID
     values: Vec<Option<V>>,
@@ -548,6 +554,23 @@ pub struct VarStore<V> {
     /// whatever the new value happens to be allocated at; see
     /// [`generation`](Self::generation).
     generations: Vec<u64>,
+    /// Which store the generations count in; see [`serial`](Self::serial).
+    serial: u64,
+}
+
+/// Source of [`VarStore::serial`].
+static NEXT_VAR_STORE_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+impl<V: Clone> Clone for VarStore<V> {
+    /// A clone is written independently of the original, so its generations
+    /// count in a store of their own.
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            generations: self.generations.clone(),
+            serial: NEXT_VAR_STORE_SERIAL.fetch_add(1, Ordering::Relaxed),
+        }
+    }
 }
 
 impl<V> VarStore<V> {
@@ -560,7 +583,20 @@ impl<V> VarStore<V> {
         Self {
             values,
             generations: vec![0; size],
+            serial: NEXT_VAR_STORE_SERIAL.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// A number no other store — live or dropped — carries.
+    ///
+    /// Generations count writes *within one store*, so two stores can show the
+    /// same generation for a slot that holds different values. A consumer that
+    /// remembers a generation remembers this serial with it: replacing the
+    /// store of a [`DynamicContext`] (its `variables` field is public), by a new
+    /// store or by a clone, then never looks like "nothing was written".
+    #[inline]
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// Get a variable value by slot ID.
@@ -795,6 +831,39 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
         &mut self.collation_cache
     }
 
+    /// The static context's default collation for one comparison: resolved —
+    /// through this run's memo — only when that comparison actually compares
+    /// two strings. See [`DeferredDefault`](crate::xpath::collation::DeferredDefault).
+    #[inline]
+    pub(crate) fn deferred_default_collation(
+        &mut self,
+    ) -> crate::xpath::collation::DeferredDefault<'_> {
+        let static_context = self.static_context;
+        crate::xpath::collation::DeferredDefault::with_memo(
+            static_context,
+            &mut self.collation_cache,
+        )
+    }
+
+    /// The general-comparison index cache and the deferred default collation at
+    /// once, for a probe that needs both.
+    #[inline]
+    pub(crate) fn compare_cache_and_default_collation(
+        &mut self,
+    ) -> (
+        &mut crate::xpath::compare_cache::GeneralCompareCache,
+        crate::xpath::collation::DeferredDefault<'_>,
+    ) {
+        let static_context = self.static_context;
+        (
+            &mut self.compare_cache,
+            crate::xpath::collation::DeferredDefault::with_memo(
+                static_context,
+                &mut self.collation_cache,
+            ),
+        )
+    }
+
     /// The collations resolved during this run. Test-only, like
     /// [`regex_cache`](Self::regex_cache).
     #[cfg(test)]
@@ -813,6 +882,12 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
     #[inline]
     pub(crate) fn variable_generation(&self, slot: VarSlotId) -> u64 {
         self.variables.generation(slot)
+    }
+
+    /// The [serial](VarStore::serial) of the store the variables live in now.
+    #[inline]
+    pub(crate) fn variable_store_serial(&self) -> u64 {
+        self.variables.serial()
     }
 
     /// Set a variable value.
@@ -1566,9 +1641,9 @@ mod xpath10_compatibility_tests {
         assert_eq!(rejected.error_code(), Some("XPST0003"));
     }
 
-    /// The semantics the flag switches: 1.0 arithmetic, 1.0 effective boolean
-    /// value for a multi-item sequence, and the 1.0 first-item conversion of
-    /// `fn:string`/`fn:number`.
+    /// The semantics the flag switches: 1.0 arithmetic and the 1.0 first-item
+    /// conversion of `fn:string`/`fn:number` — and the one it does not: the
+    /// effective boolean value.
     #[test]
     fn xpath10_compatibility_switches_the_semantics() {
         use crate::xpath::api::XPathExpr;
@@ -1593,12 +1668,14 @@ mod xpath10_compatibility_tests {
             .unwrap()
             .is_infinite());
 
-        // Effective boolean value of a multi-item non-node sequence: an error
-        // in 2.0 (FORG0006), the 1.0 rule under the flag.
+        // The effective boolean value is XPath 2.0's (§2.4.3) with the flag
+        // either way: a sequence of two atomic values is FORG0006.
         assert!(run("if (('a', 'b')) then 1 else 2", &plain).is_err());
         assert_eq!(
-            run("('a', 'b') and true()", &compat).unwrap().as_bool(),
-            Some(true)
+            run("('a', 'b') and true()", &compat)
+                .err()
+                .and_then(|e| e.error_code()),
+            Some("FORG0006")
         );
 
         // fn:string / fn:number take the first item of a sequence.

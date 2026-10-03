@@ -533,6 +533,23 @@ impl XPathError {
         )
     }
 
+    /// XPST0080: the target type of a `cast as` or `castable as` expression is
+    /// `xs:NOTATION` or `xs:anyAtomicType` (XPath 2.0 §3.10.2, §3.10.3).
+    ///
+    /// The code has no dedicated variant, so it travels as an error QName; see
+    /// [`XPathError::raised`]. [`XPathError::error_code`] answers
+    /// `Some("XPST0080")`.
+    pub(crate) fn cast_target_not_instantiable(type_name: &str) -> Self {
+        XPathError::raised(
+            XQT_ERRORS_NAMESPACE,
+            "XPST0080",
+            Some(&format!(
+                "'{type_name}' cannot be the target type of a cast: \
+                 xs:NOTATION and xs:anyAtomicType are not instantiable"
+            )),
+        )
+    }
+
     /// FONS0004: no namespace binding for a prefix.
     ///
     /// The code has no dedicated variant, so it travels as an error QName; see
@@ -652,6 +669,7 @@ pub const QNAMED_ERROR_CODES: &[&str] = &[
     "FODC0001",
     "FONS0004",
     "FORG0002",
+    "XPST0080",
 ];
 
 /// The error QName and description of an error raised by `fn:error`.

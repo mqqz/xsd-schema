@@ -238,6 +238,12 @@ pub fn bind_node(
                 Some(ItemTypeNode::Atomic(ref qname)) => {
                     let resolved = resolve_atomic_type_qname(qname, ctx)?;
                     check_atomic_type_name(&resolved, qname, ctx)?;
+                    if matches!(
+                        type_expr.kind,
+                        TypeExprKind::CastAs | TypeExprKind::CastableAs
+                    ) {
+                        check_cast_target(&resolved, qname, ctx)?;
+                    }
                     if let AstNode::TypeExpr(ref mut node) = arena.get_mut(id) {
                         node.resolved_atomic_type = Some(resolved);
                     }
@@ -338,16 +344,62 @@ fn check_kind_test_prefixes(
         },
         KindTest::Element(test) => {
             check_optional_qname_prefix(test.name.as_ref(), ctx)?;
-            check_optional_qname_prefix(test.type_name.as_ref(), ctx)
+            check_optional_qname_prefix(test.type_name.as_ref(), ctx)?;
+            check_type_name_in_scope(test.type_name.as_ref(), ctx)
         }
         KindTest::Attribute(test) => {
             check_optional_qname_prefix(test.name.as_ref(), ctx)?;
-            check_optional_qname_prefix(test.type_name.as_ref(), ctx)
+            check_optional_qname_prefix(test.type_name.as_ref(), ctx)?;
+            check_type_name_in_scope(test.type_name.as_ref(), ctx)
         }
         KindTest::SchemaElement(name) | KindTest::SchemaAttribute(name) => {
             check_lexical_qname_prefix(name, ctx)
         }
     }
+}
+
+/// `XPST0008` unless the `TypeName` of an `element(N, T)` / `attribute(N, T)`
+/// test (if any) names a type in the in-scope schema types.
+///
+/// XPath 2.0 §2.5.4.3: "TypeName must be present in the in-scope schema types
+/// \[err:XPST0008\]" (§2.5.4.5 for attributes). The in-scope schema types are
+/// the built-in types of the XML Schema namespace — which include `xs:untyped`
+/// and `xs:untypedAtomic` (§2.5.1) — plus, when a schema set is attached, its
+/// named types. An unprefixed `TypeName` is in the default element/type
+/// namespace. The prefix has already been checked (XPST0081).
+fn check_type_name_in_scope(
+    type_name: Option<&QName>,
+    ctx: &XPathContext<'_>,
+) -> Result<(), XPathError> {
+    let Some(type_name) = type_name else {
+        return Ok(());
+    };
+    let ns_id = if type_name.prefix.is_empty() {
+        ctx.default_element_ns
+    } else {
+        ctx.resolve_prefix(&type_name.prefix)
+            .map(|uri| ctx.names.add(&uri))
+    };
+    let is_xs = ns_id == Some(crate::namespace::table::well_known::XS_NAMESPACE);
+    let in_scope = if is_xs {
+        type_name.local == "untyped" || XmlTypeCode::from_local_name(&type_name.local).is_some()
+    } else {
+        ctx.schema_set.is_some_and(|schema_set| {
+            schema_set
+                .lookup_type(ns_id, ctx.names.add(&type_name.local))
+                .is_some()
+        })
+    };
+    if in_scope {
+        return Ok(());
+    }
+    Err(XPathError::undefined_qname(
+        if type_name.prefix.is_empty() {
+            type_name.local.clone()
+        } else {
+            format!("{}:{}", type_name.prefix, type_name.local)
+        },
+    ))
 }
 
 /// `XPST0081` unless `qname` is absent, unprefixed, or carries a prefix the
@@ -503,8 +555,8 @@ fn resolve_atomic_type_qname(
 /// plus, when a schema set is attached to the static context, its named types.
 ///
 /// Note: `xs:NOTATION` and `xs:anyAtomicType` are atomic types and so pass this
-/// check, although §3.10.2 forbids them as the target of a `cast`; that separate
-/// rule has its own error code, which this crate's error type cannot yet carry.
+/// check; §3.10.2 forbids them as the target of a `cast` with a separate rule
+/// and code, which [`check_cast_target`] applies (XPST0080).
 fn check_atomic_type_name(
     resolved: &QualifiedName,
     raw: &QName,
@@ -547,6 +599,45 @@ fn check_atomic_type_name(
         Some(crate::ids::TypeKey::Simple(_)) => Ok(()),
         _ => Err(unknown()),
     }
+}
+
+/// Check the target type of a `cast as` / `castable as` beyond its being an
+/// atomic type.
+///
+/// XPath 2.0 §3.10.2 (and §3.10.3 in the same words): "The target type must be
+/// an atomic type that is in the in-scope schema types \[err:XPST0051\]. In
+/// addition, the target type cannot be xs:NOTATION or xs:anyAtomicType
+/// \[err:XPST0080\]." Both names pass [`check_atomic_type_name`] — they are
+/// atomic types, legal in `instance of` and `treat as` — so this is the second,
+/// cast-only rule. The error is static, so it is raised here, while binding.
+fn check_cast_target(
+    resolved: &QualifiedName,
+    raw: &QName,
+    ctx: &XPathContext<'_>,
+) -> Result<(), XPathError> {
+    let is_xs = resolved
+        .namespace_uri
+        .and_then(|id| ctx.names.try_resolve(id))
+        .is_some_and(|ns| ns == XS_NAMESPACE);
+    if !is_xs {
+        return Ok(());
+    }
+    let code = ctx
+        .names
+        .try_resolve(resolved.local_name)
+        .and_then(|local| XmlTypeCode::from_local_name(&local));
+    if matches!(
+        code,
+        Some(XmlTypeCode::Notation | XmlTypeCode::AnyAtomicType)
+    ) {
+        let name = if raw.prefix.is_empty() {
+            raw.local.clone()
+        } else {
+            format!("{}:{}", raw.prefix, raw.local)
+        };
+        return Err(XPathError::cast_target_not_instantiable(&name));
+    }
+    Ok(())
 }
 
 /// Try to bind a function call as an XPath 2.0 constructor function.

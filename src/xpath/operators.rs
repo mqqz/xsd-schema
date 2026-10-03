@@ -72,7 +72,13 @@ const XPATH_DECIMAL_DIV_SCALE: u32 = 18;
 /// Evaluate a unary operator for a single atomic value.
 pub fn eval_unary(op: UnaryOpKind, value: &XmlValue) -> Result<XmlValue, XPathError> {
     match op {
-        UnaryOpKind::Identity => Ok(value.clone()),
+        // XPath 2.0 §3.4 and §B.2: unary `+` is `op:numeric-unary-plus($arg as
+        // numeric)`, with the same untypedAtomic-to-xs:double cast and the
+        // same XPTY0004 for a non-numeric operand as unary `-`. F&O §6.2.7:
+        // "The returned value is equal to $arg, and is an instance of
+        // xs:integer, xs:decimal, xs:double, or xs:float depending on the type
+        // of $arg."
+        UnaryOpKind::Identity => eval_numeric_unary_op(value, false),
         UnaryOpKind::Negate => eval_numeric_unary(value),
     }
 }
@@ -784,6 +790,11 @@ fn numeric_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
 }
 
 fn eval_numeric_unary(value: &XmlValue) -> Result<XmlValue, XPathError> {
+    eval_numeric_unary_op(value, true)
+}
+
+/// Unary `-` (`negate`) or unary `+` on one atomic operand.
+fn eval_numeric_unary_op(value: &XmlValue, negate: bool) -> Result<XmlValue, XPathError> {
     // Per XPath 2.0 spec, UntypedAtomic is cast to xs:double for arithmetic
     let promoted;
     let value = if value.type_code == XmlTypeCode::UntypedAtomic {
@@ -804,11 +815,15 @@ fn eval_numeric_unary(value: &XmlValue) -> Result<XmlValue, XPathError> {
     let result_type = unary_result_type(class);
     let value = to_numeric_value(value, class)?;
 
-    let result = match value {
-        NumericValue::Integer(v) => NumericValue::Integer(-v),
-        NumericValue::Decimal(v) => NumericValue::Decimal(-v),
-        NumericValue::Float(v) => NumericValue::Float(-v),
-        NumericValue::Double(v) => NumericValue::Double(-v),
+    let result = if !negate {
+        value
+    } else {
+        match value {
+            NumericValue::Integer(v) => NumericValue::Integer(-v),
+            NumericValue::Decimal(v) => NumericValue::Decimal(-v),
+            NumericValue::Float(v) => NumericValue::Float(-v),
+            NumericValue::Double(v) => NumericValue::Double(-v),
+        }
     };
 
     Ok(numeric_to_xml_value(result, result_type))
@@ -928,23 +943,44 @@ fn numeric_idiv(left: NumericValue, right: NumericValue) -> Result<XmlValue, XPa
             NumericValue::Integer(decimal_to_bigint(&q)?)
         }
         (NumericValue::Float(l), NumericValue::Float(r)) => {
-            let q = l / r;
-            if q.is_nan() || q.is_infinite() {
-                return Err(XPathError::FOAR0001);
-            }
-            NumericValue::Integer(BigInt::from(q.trunc() as i64))
+            NumericValue::Integer(float_idiv(f64::from(l), f64::from(r), |q| {
+                f64::from(q as f32)
+            })?)
         }
         (NumericValue::Double(l), NumericValue::Double(r)) => {
-            let q = l / r;
-            if q.is_nan() || q.is_infinite() {
-                return Err(XPathError::FOAR0001);
-            }
-            NumericValue::Integer(BigInt::from(q.trunc() as i64))
+            NumericValue::Integer(float_idiv(l, r, |q| q)?)
         }
         _ => return Err(XPathError::internal("Numeric idiv type mismatch")),
     };
 
     Ok(numeric_to_xml_value(result, XmlTypeCode::Integer))
+}
+
+/// `idiv` of two `xs:float` or `xs:double` values (both given as `f64`;
+/// `round` brings the quotient back to the operands' precision).
+///
+/// F&O §6.2.5: "If $arg2 is (positive or negative) zero, then an error is
+/// raised \[err:FOAR0001\]. If either operand is NaN or if $arg1 is INF or
+/// -INF then an error is raised \[err:FOAR0002\]. If $arg2 is INF or -INF (and
+/// $arg1 is not) then the result is zero." A quotient too large for the
+/// floating-point type is the overflow FOAR0002 names too; any finite quotient
+/// becomes the exact xs:integer of its truncation, however large.
+fn float_idiv(l: f64, r: f64, round: impl Fn(f64) -> f64) -> Result<BigInt, XPathError> {
+    if r == 0.0 {
+        return Err(XPathError::FOAR0001);
+    }
+    if l.is_nan() || r.is_nan() || l.is_infinite() {
+        return Err(XPathError::FOAR0002);
+    }
+    let quotient = round(l / r);
+    if quotient.is_infinite() {
+        return Err(XPathError::FOAR0002);
+    }
+    let truncated = quotient.trunc();
+    // `{:.0}` prints every digit of a finite integral `f64`.
+    format!("{truncated:.0}")
+        .parse::<BigInt>()
+        .map_err(|_| XPathError::FOAR0002)
 }
 
 fn numeric_mod(
@@ -978,10 +1014,8 @@ fn numeric_mod(
 /// expressions are cast to `xs:double`.
 fn cast_untyped_to_double(value: &XmlValue) -> Result<XmlValue, XPathError> {
     let s = value.to_string_value();
-    let d: f64 = s
-        .trim()
-        .parse()
-        .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
+    let d = crate::xpath::cast::parse_xsd_double(&s)
+        .ok_or_else(|| XPathError::invalid_cast_value(&s, "xs:double"))?;
     Ok(XmlValue::double(d))
 }
 
@@ -2033,10 +2067,8 @@ pub fn magnitude_relationship(
         if right.type_code.is_numeric() {
             // Promote to double
             let s = left.to_string_value();
-            let d: f64 = s
-                .trim()
-                .parse()
-                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
+            let d = crate::xpath::cast::parse_xsd_double(&s)
+                .ok_or_else(|| XPathError::invalid_cast_value(&s, "xs:double"))?;
             left_result = XmlValue::double(d);
         } else if is_string_like(right.type_code) {
             // Keep as string
@@ -2050,10 +2082,8 @@ pub fn magnitude_relationship(
         if left_result.type_code.is_numeric() {
             // Promote to double
             let s = right.to_string_value();
-            let d: f64 = s
-                .trim()
-                .parse()
-                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
+            let d = crate::xpath::cast::parse_xsd_double(&s)
+                .ok_or_else(|| XPathError::invalid_cast_value(&s, "xs:double"))?;
             right_result = XmlValue::double(d);
         } else if is_string_like(left_result.type_code) {
             // Keep as string
@@ -2288,10 +2318,8 @@ pub fn magnitude_relationship_ctx(
         if right.type_code.is_numeric() {
             // Numeric → cast to xs:double
             let s = left_result.to_string_value();
-            let d: f64 = s
-                .trim()
-                .parse()
-                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
+            let d = crate::xpath::cast::parse_xsd_double(&s)
+                .ok_or_else(|| XPathError::invalid_cast_value(&s, "xs:double"))?;
             left_result = XmlValue::double(d);
         } else if is_string_like(right.type_code) {
             // String-like → cast to xs:string
@@ -2308,10 +2336,8 @@ pub fn magnitude_relationship_ctx(
         if left_result.type_code.is_numeric() {
             // Numeric → cast to xs:double
             let s = right_result.to_string_value();
-            let d: f64 = s
-                .trim()
-                .parse()
-                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
+            let d = crate::xpath::cast::parse_xsd_double(&s)
+                .ok_or_else(|| XPathError::invalid_cast_value(&s, "xs:double"))?;
             right_result = XmlValue::double(d);
         } else if is_string_like(left_result.type_code) {
             // String-like → cast to xs:string
@@ -2516,15 +2542,29 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let right_buf = BufferedNodeIterator::preload(right.clone())?;
+    // The static context's default collation, resolved only if two strings are
+    // actually compared, and then once for the whole comparison rather than
+    // once per pair. Under the codepoint collation — the default, and the only
+    // collation without a host resolver — this is an `Option::is_none()` and
+    // the handle is `Codepoint`, which is the code path every line below took
+    // before collations existed.
+    let deferred = collation::DeferredDefault::new(context);
+    general_eq_iter_collated(context, left, right, deferred.as_ref())
+}
 
-    // The static context's default collation, resolved once for the whole
-    // comparison rather than once per pair. Under the codepoint collation —
-    // the default, and the only collation without a host resolver — this is an
-    // `Option::is_none()` and `collation` stays `None`, which is the code path
-    // every line below took before collations existed.
-    let active = collation::resolve_default(context);
-    let collation = active.as_ref();
+/// [`general_eq_iter`] under the collation `collation` — the evaluator's entry
+/// point, which hands in a default collation resolved through the per-run memo.
+pub(crate) fn general_eq_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let right_buf = BufferedNodeIterator::preload(right.clone())?;
 
     // Walk a bounded prefix of the Cartesian product first. Every comparison
     // whose product is no larger than the budget, and every comparison whose
@@ -2542,7 +2582,7 @@ where
         return result;
     }
 
-    general_eq_iter_pairwise(context, left, &right_buf)
+    Ok(general_eq_scan(context, left, &right_buf, usize::MAX, collation)?.unwrap_or(false))
 }
 
 /// How many pairs of the Cartesian product are compared before an index is
@@ -2555,7 +2595,10 @@ where
 const INDEX_AFTER_PAIRS: usize = 64;
 
 /// The Cartesian-product evaluation of `A = B`, and the definition of what the
-/// indexed path in [`general_compare`] must reproduce exactly.
+/// indexed path in [`general_compare`] must reproduce exactly. (The production
+/// paths run the same [`general_eq_scan`] with an unbounded budget; this is the
+/// tests' reference.)
+#[cfg(test)]
 pub(super) fn general_eq_iter_pairwise<I1, I2>(
     context: &XPathContext,
     left: &I1,
@@ -2565,8 +2608,8 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let active = collation::resolve_default(context);
-    Ok(general_eq_scan(context, left, right_buf, usize::MAX, active.as_ref())?.unwrap_or(false))
+    let deferred = collation::DeferredDefault::new(context);
+    Ok(general_eq_scan(context, left, right_buf, usize::MAX, deferred.as_ref())?.unwrap_or(false))
 }
 
 /// Walk at most `budget` pairs of the product in row-major order.
@@ -2632,10 +2675,22 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let right_buf = BufferedNodeIterator::preload(right.clone())?;
+    let deferred = collation::DeferredDefault::new(context);
+    general_ne_iter_collated(context, left, right, deferred.as_ref())
+}
 
-    let active = collation::resolve_default(context);
-    let collation = active.as_ref();
+/// [`general_ne_iter`] under the collation `collation`.
+pub(crate) fn general_ne_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let right_buf = BufferedNodeIterator::preload(right.clone())?;
 
     // `!=` already stops at the first unequal pair, so the bounded prefix
     // decides it in practice; the index is only there for the degenerate
@@ -2649,10 +2704,12 @@ where
         return result;
     }
 
-    general_ne_iter_pairwise(context, left, &right_buf)
+    Ok(general_ne_scan(context, left, &right_buf, usize::MAX, collation)?.unwrap_or(false))
 }
 
-/// The Cartesian-product evaluation of `A != B`.
+/// The Cartesian-product evaluation of `A != B` (the tests' reference, like
+/// [`general_eq_iter_pairwise`]).
+#[cfg(test)]
 pub(super) fn general_ne_iter_pairwise<I1, I2>(
     context: &XPathContext,
     left: &I1,
@@ -2662,8 +2719,8 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let active = collation::resolve_default(context);
-    Ok(general_ne_scan(context, left, right_buf, usize::MAX, active.as_ref())?.unwrap_or(false))
+    let deferred = collation::DeferredDefault::new(context);
+    Ok(general_ne_scan(context, left, right_buf, usize::MAX, deferred.as_ref())?.unwrap_or(false))
 }
 
 /// The `!=` counterpart of [`general_eq_scan`]; see it for what `Ok(None)` means.
@@ -2723,9 +2780,22 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
+    let deferred = collation::DeferredDefault::new(context);
+    general_lt_iter_collated(context, left, right, deferred.as_ref())
+}
+
+/// [`general_lt_iter`] under the collation `collation`.
+pub(crate) fn general_lt_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let active = collation::resolve_default(context);
-    let collation = active.as_ref();
     let mut left_atoms = AtomCursor::new(left.clone());
 
     while let Some(left_value) = left_atoms.next_atom()? {
@@ -2754,9 +2824,22 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
+    let deferred = collation::DeferredDefault::new(context);
+    general_le_iter_collated(context, left, right, deferred.as_ref())
+}
+
+/// [`general_le_iter`] under the collation `collation`.
+pub(crate) fn general_le_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let active = collation::resolve_default(context);
-    let collation = active.as_ref();
     let mut left_atoms = AtomCursor::new(left.clone());
 
     while let Some(left_value) = left_atoms.next_atom()? {
@@ -2792,9 +2875,22 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
+    let deferred = collation::DeferredDefault::new(context);
+    general_gt_iter_collated(context, left, right, deferred.as_ref())
+}
+
+/// [`general_gt_iter`] under the collation `collation`.
+pub(crate) fn general_gt_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let active = collation::resolve_default(context);
-    let collation = active.as_ref();
     let mut left_atoms = AtomCursor::new(left.clone());
 
     while let Some(left_value) = left_atoms.next_atom()? {
@@ -2823,9 +2919,22 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
+    let deferred = collation::DeferredDefault::new(context);
+    general_ge_iter_collated(context, left, right, deferred.as_ref())
+}
+
+/// [`general_ge_iter`] under the collation `collation`.
+pub(crate) fn general_ge_iter_collated<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
-    let active = collation::resolve_default(context);
-    let collation = active.as_ref();
     let mut left_atoms = AtomCursor::new(left.clone());
 
     while let Some(left_value) = left_atoms.next_atom()? {

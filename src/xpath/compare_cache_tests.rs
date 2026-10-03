@@ -28,6 +28,7 @@ use crate::types::sequence::SequenceType;
 use crate::xpath::ast::{AstNode, BinaryOpKind};
 use crate::xpath::bind::bind_node;
 use crate::xpath::context::NameBinder;
+use crate::xpath::context::VarStore;
 use crate::xpath::functions::{DynamicFunctionSignature, FunctionSet};
 use crate::xpath::general_compare::tests::{draw, families, Rng};
 use crate::xpath::iterator::BufferedNodeIterator;
@@ -1131,4 +1132,154 @@ fn without_a_write_the_index_still_answers() {
     // evaluations 3 and 4 were answered from it.
     assert_eq!(run.answered, 2);
     assert_eq!(plan.calls.load(Ordering::Relaxed), 4);
+}
+
+// ============================================================================
+// Identity of the arena and of the variable store
+// ============================================================================
+
+/// A host function `my:eval($source)` that compiles `$source` and evaluates it on
+/// the caller's own `DynamicContext` — the natural way to write a dynamic
+/// evaluation extension. Every call stores its freshly bound arena in **the same
+/// heap slot**, so two calls evaluate two different arenas at one address: the
+/// situation in which an address is not an identity. Returns the function set and
+/// the addresses the arenas were evaluated at.
+fn evaluating_functions() -> (FunctionSet<Nav>, Arc<std::sync::Mutex<Vec<usize>>>) {
+    use crate::xpath::functions::signature::types::{any, string};
+    let held: Arc<std::sync::Mutex<Box<(AstArena, AstNodeId)>>> =
+        Arc::new(std::sync::Mutex::new(Box::new((AstArena::new(), 0))));
+    let addresses = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&addresses);
+    let mut functions: FunctionSet<Nav> = FunctionSet::with_builtins();
+    functions.register(
+        DynamicFunctionSignature::new(MUT_NS, "eval", vec![string()], any()),
+        move |ctx, args| {
+            let source = args[0]
+                .first()
+                .and_then(|item| item.as_atomic())
+                .map(|value| value.to_string_value())
+                .expect("a string argument");
+            let mut parsed = parse(&source).expect("the inner expression parses");
+            let mut binder = NameBinder::new();
+            bind_node(
+                &mut parsed.arena,
+                parsed.root,
+                ctx.static_context,
+                &mut binder,
+            )?;
+            let mut slot = held.lock().unwrap();
+            // Overwrite in place: the old arena is dropped and the new one lands
+            // at the very address the old one had.
+            **slot = (parsed.arena, parsed.root);
+            seen.lock()
+                .unwrap()
+                .push(&slot.0 as *const AstArena as usize);
+            let (arena, root) = &**slot;
+            eval_node(arena, *root, ctx)
+        },
+    );
+    (functions, addresses)
+}
+
+/// Review finding X-09, the reviewer's own reproduction: the second inner
+/// expression must not be answered from the first one's index although both
+/// arenas sit at the same address and number their nodes identically. (The
+/// literal operand reads no variable, so no fingerprint can tell them apart —
+/// only the arena's identity can.)
+#[test]
+fn an_arena_at_a_recycled_address_is_not_answered_from_the_old_index() {
+    let names = NameTable::new();
+    let (functions, addresses) = evaluating_functions();
+    let mut namespaces = NamespaceContextSnapshot::default();
+    namespaces
+        .bindings
+        .push((names.add("my"), names.add(MUT_NS)));
+    let ctx = XPathContext::new(&names)
+        .with_namespaces(namespaces)
+        .with_function_catalog(&functions);
+    let compiled = compile(
+        &names,
+        &ctx,
+        "(my:eval('for $i in 1 to 3 return $i = (1,2,3)'), \
+          my:eval('for $i in 1 to 3 return $i = (7,8,9)'))",
+        &[],
+    );
+    // The inner expressions number their `$i` from slot 0 of a binder of their
+    // own; give the shared store room for it.
+    let mut dyn_ctx: DynamicContext<'_, Nav> =
+        DynamicContext::new(&ctx, compiled.slots.max(4)).with_function_evaluator(&functions);
+    let result = eval_node(&compiled.arena, compiled.root, &mut dyn_ctx).unwrap();
+    let addresses = addresses.lock().unwrap().clone();
+    assert_eq!(addresses.len(), 2);
+    assert_eq!(
+        addresses[0], addresses[1],
+        "the test needs both inner arenas at one address"
+    );
+    assert_eq!(
+        atomics(&result),
+        [true, true, true, false, false, false]
+            .into_iter()
+            .map(XmlValue::boolean)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Review finding X-09, variable side: `DynamicContext::variables` is public, so
+/// a host can replace the whole store between two evaluations. Generations count
+/// writes within one store, and a single-item binding records no address, so the
+/// new store's `$c` — written once, like the old one's — would look unchanged.
+#[test]
+fn replacing_the_variable_store_rebuilds_the_index() {
+    let names = NameTable::new();
+    let ctx = XPathContext::new(&names);
+    let big: Vec<XmlValue> = (0..20i64)
+        .map(|i| XmlValue::integer(BigInt::from(i)))
+        .collect();
+    let compiled = compile(&names, &ctx, "$big[. = $c]", &["big", "c"]);
+    let mut dyn_ctx: DynamicContext<'_, Nav> = DynamicContext::new(&ctx, compiled.slots);
+    dyn_ctx.set_variable(compiled.vars[0], sequence(&big));
+    dyn_ctx.set_variable(compiled.vars[1], XPathValue::integer(5));
+    let first = eval_node(&compiled.arena, compiled.root, &mut dyn_ctx).unwrap();
+    assert_eq!(atomics(&first), vec![XmlValue::integer(BigInt::from(5))]);
+    assert_eq!(states(dyn_ctx.general_compare_cache()), vec!["ready"]);
+
+    // A fresh store, written exactly as often as the old one was.
+    dyn_ctx.variables = VarStore::new(compiled.slots);
+    dyn_ctx.set_variable(compiled.vars[0], sequence(&big));
+    dyn_ctx.set_variable(compiled.vars[1], XPathValue::integer(7));
+    let second = eval_node(&compiled.arena, compiled.root, &mut dyn_ctx).unwrap();
+    assert_eq!(atomics(&second), vec![XmlValue::integer(BigInt::from(7))]);
+
+    // A clone of the store, rewritten: the same generations, other values.
+    let mut copy = dyn_ctx.variables.clone();
+    copy.set(compiled.vars[1], XPathValue::integer(9));
+    let mut fresh = VarStore::new(compiled.slots);
+    fresh.set(compiled.vars[0], sequence(&big));
+    fresh.set(compiled.vars[1], XPathValue::integer(9));
+    dyn_ctx.variables = fresh;
+    let third = eval_node(&compiled.arena, compiled.root, &mut dyn_ctx).unwrap();
+    assert_eq!(atomics(&third), vec![XmlValue::integer(BigInt::from(9))]);
+    dyn_ctx.variables = copy;
+    let fourth = eval_node(&compiled.arena, compiled.root, &mut dyn_ctx).unwrap();
+    assert_eq!(atomics(&fourth), vec![XmlValue::integer(BigInt::from(9))]);
+}
+
+/// An arena gets a new serial whenever it can have changed, and a clone is a
+/// different arena.
+#[test]
+fn an_arena_serial_changes_with_every_mutation_and_clone() {
+    let mut arena = AstArena::new();
+    let created = arena.serial();
+    assert_ne!(created, 0, "0 stands for no arena");
+    let id = arena.add(AstNode::Value(crate::xpath::ast::ValueNode::Empty));
+    let added = arena.serial();
+    assert_ne!(added, created);
+    let clone = arena.clone();
+    assert_ne!(clone.serial(), added);
+    let _ = arena.get_mut(id);
+    assert_ne!(arena.serial(), added);
+    let before_clear = arena.serial();
+    arena.clear();
+    assert_ne!(arena.serial(), before_clear);
+    assert_ne!(AstArena::new().serial(), AstArena::new().serial());
 }

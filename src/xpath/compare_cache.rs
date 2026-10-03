@@ -24,8 +24,11 @@
 //! [`XPathEvaluator::run`](crate::xpath::XPathEvaluator::run) and dropped when
 //! that run returns: one cache per run, never in the compiled expression (which
 //! is shared and immutable) and never global. Entries are keyed by the identity
-//! of the comparison's AST node — its arena address and its node id, so that a
-//! nested evaluation over a different arena can never collide with them.
+//! of the comparison's AST node — its arena's [serial](AstArena::serial) and its
+//! node id, so that a nested evaluation over a different arena can never collide
+//! with them. The serial and not the address: a host function that compiles and
+//! evaluates expressions of its own on the same `DynamicContext` can drop one
+//! arena and get the next one allocated at the very same address.
 //!
 //! # When an operand counts as invariant
 //!
@@ -108,7 +111,7 @@ use ahash::AHasher;
 
 use crate::types::value::XmlValue;
 use crate::xpath::arena::{AstArena, AstNodeId};
-use crate::xpath::collation::{self, CollationRef};
+use crate::xpath::collation::CollationRef;
 use crate::xpath::context::{DynamicContext, VarSlotId, XPathContext};
 use crate::xpath::deps::{self, SlotSet};
 use crate::xpath::error::XPathError;
@@ -190,7 +193,7 @@ pub(crate) fn eval_general_eq_ne<N: DomNavigator>(
     is_eq: bool,
     ctx: &mut DynamicContext<'_, N>,
 ) -> Result<bool, XPathError> {
-    let arena_id = arena as *const AstArena as usize;
+    let arena_id = arena.serial();
     let plan = ctx.general_compare_cache_mut().plan(arena_id, node);
 
     match plan {
@@ -225,7 +228,7 @@ pub(crate) fn eval_general_eq_ne<N: DomNavigator>(
                 (left_print, &left_value),
                 (right_print, &right_value),
             );
-            compare_values(ctx.static_context, left_value, right_value, is_eq)
+            compare_values(ctx, left_value, right_value, is_eq)
         }
 
         Plan::Probe(side) => probe_plan(arena, arena_id, node, left, right, side, is_eq, ctx),
@@ -243,7 +246,7 @@ fn plain<N: DomNavigator>(
 ) -> Result<bool, XPathError> {
     let left_value = eval_node(arena, left, ctx)?;
     let right_value = eval_node(arena, right, ctx)?;
-    compare_values(ctx.static_context, left_value, right_value, is_eq)
+    compare_values(ctx, left_value, right_value, is_eq)
 }
 
 /// One evaluation of a comparison node whose invariant operand is already
@@ -251,7 +254,7 @@ fn plain<N: DomNavigator>(
 #[allow(clippy::too_many_arguments)]
 fn probe_plan<N: DomNavigator>(
     arena: &AstArena,
-    arena_id: usize,
+    arena_id: u64,
     node: AstNodeId,
     left: AstNodeId,
     right: AstNodeId,
@@ -318,7 +321,7 @@ fn probe_plan<N: DomNavigator>(
                 },
             };
             let (left_value, right_value) = side.order(varying_value, other);
-            compare_values(ctx.static_context, left_value, right_value, is_eq)
+            compare_values(ctx, left_value, right_value, is_eq)
         }
     };
 
@@ -328,19 +331,23 @@ fn probe_plan<N: DomNavigator>(
     result
 }
 
-/// The comparison as the evaluator ran it before this module existed.
+/// The comparison as the evaluator ran it before this module existed, with the
+/// default collation resolved — through the per-run memo — only if two strings
+/// are compared.
 fn compare_values<N: DomNavigator>(
-    context: &XPathContext,
+    ctx: &mut DynamicContext<'_, N>,
     left: XPathValue<N>,
     right: XPathValue<N>,
     is_eq: bool,
 ) -> Result<bool, XPathError> {
+    let context = ctx.static_context;
     let left_iter = VecNodeIterator::new(left.into_vec());
     let right_iter = VecNodeIterator::new(right.into_vec());
+    let deferred = ctx.deferred_default_collation();
     if is_eq {
-        operators::general_eq_iter(context, &left_iter, &right_iter)
+        operators::general_eq_iter_collated(context, &left_iter, &right_iter, deferred.as_ref())
     } else {
-        operators::general_ne_iter(context, &left_iter, &right_iter)
+        operators::general_ne_iter_collated(context, &left_iter, &right_iter, deferred.as_ref())
     }
 }
 
@@ -522,6 +529,10 @@ impl CachedOperand {
 /// free check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ValueId {
+    /// The [serial](crate::xpath::VarStore) of the store the slot lives in: a
+    /// generation counts writes within one store only, and the store of a
+    /// `DynamicContext` can be replaced wholesale.
+    store: u64,
     /// How often the slot had been written.
     generation: u64,
     shape: Shape,
@@ -546,6 +557,7 @@ fn value_id<N: DomNavigator>(ctx: &DynamicContext<'_, N>, slot: VarSlotId) -> Va
         }
     };
     ValueId {
+        store: ctx.variable_store_serial(),
         generation: ctx.variable_generation(slot),
         shape,
     }
@@ -606,8 +618,9 @@ enum Plan {
 /// the first general comparison of the run is evaluated.
 #[derive(Default)]
 pub(crate) struct GeneralCompareCache {
-    /// Identity of the AST arena `entries` belong to.
-    arena: usize,
+    /// [Serial](AstArena::serial) of the AST arena `entries` belong to; `0`
+    /// (which no arena carries) before the first comparison of the run.
+    arena: u64,
     entries: Vec<Entry>,
     /// The range variables of that arena, computed once on first use.
     range_vars: Option<SlotSet>,
@@ -620,7 +633,7 @@ pub(crate) struct GeneralCompareCache {
 
 impl GeneralCompareCache {
     /// Decide what to do with the comparison node `node` of the arena `arena`.
-    fn plan(&mut self, arena: usize, node: AstNodeId) -> Plan {
+    fn plan(&mut self, arena: u64, node: AstNodeId) -> Plan {
         if self.arena != arena {
             // A different expression is being evaluated with this context: the
             // node ids of the old one mean nothing here.
@@ -657,7 +670,7 @@ impl GeneralCompareCache {
             .get_or_insert_with(|| deps::range_var_slots(arena))
     }
 
-    fn state_mut(&mut self, arena: usize, node: AstNodeId) -> Option<&mut State> {
+    fn state_mut(&mut self, arena: u64, node: AstNodeId) -> Option<&mut State> {
         if self.arena != arena {
             return None;
         }
@@ -667,7 +680,7 @@ impl GeneralCompareCache {
             .map(|entry| &mut entry.state)
     }
 
-    fn ready(&self, arena: usize, node: AstNodeId) -> Option<&Ready> {
+    fn ready(&self, arena: u64, node: AstNodeId) -> Option<&Ready> {
         if self.arena != arena {
             return None;
         }
@@ -682,7 +695,7 @@ impl GeneralCompareCache {
 
     /// Record the outcome of considering a node, whatever it is: a node that
     /// stayed `Counting` would be analysed again on every evaluation.
-    fn settle(&mut self, arena: usize, node: AstNodeId, state: State) {
+    fn settle(&mut self, arena: u64, node: AstNodeId, state: State) {
         if let Some(slot) = self.state_mut(arena, node) {
             *slot = state;
         }
@@ -691,7 +704,7 @@ impl GeneralCompareCache {
     /// Throw an index away and let the **next** evaluation of the node consider
     /// it again, with the bindings in force then. Rebuilding rather than trusting
     /// it costs speed, never correctness.
-    fn reconsider(&mut self, arena: usize, node: AstNodeId) {
+    fn reconsider(&mut self, arena: u64, node: AstNodeId) {
         self.settle(arena, node, State::Counting(BUILD_AT_EVALUATION - 1));
     }
 
@@ -705,7 +718,7 @@ impl GeneralCompareCache {
 /// Whether the index of `node` still stands for what its operand would evaluate
 /// to with the bindings in force now.
 fn index_is_fresh<N: DomNavigator>(
-    arena_id: usize,
+    arena_id: u64,
     node: AstNodeId,
     ctx: &DynamicContext<'_, N>,
 ) -> bool {
@@ -724,7 +737,7 @@ fn index_is_fresh<N: DomNavigator>(
 /// have produced. Used only where re-evaluating the operand would read a write
 /// that source order puts after it.
 fn held_value<N: DomNavigator>(
-    arena_id: usize,
+    arena_id: u64,
     node: AstNodeId,
     ctx: &DynamicContext<'_, N>,
 ) -> Option<XPathValue<N>> {
@@ -753,7 +766,7 @@ fn held_value<N: DomNavigator>(
 /// which is where an operand whose bindings the other operand has rewritten
 /// drops out.
 fn install<N: DomNavigator>(
-    arena_id: usize,
+    arena_id: u64,
     node: AstNodeId,
     ctx: &mut DynamicContext<'_, N>,
     left: (Option<Fingerprint>, &XPathValue<N>),
@@ -815,7 +828,7 @@ fn install<N: DomNavigator>(
 /// business — [`probe_plan`] asks that before either operand is evaluated, and
 /// again afterwards.
 fn probe<N: DomNavigator>(
-    arena_id: usize,
+    arena_id: u64,
     node: AstNodeId,
     is_eq: bool,
     ctx: &mut DynamicContext<'_, N>,
@@ -829,12 +842,12 @@ fn probe<N: DomNavigator>(
 
     let static_context = ctx.static_context;
     // The static context's default collation, which cannot change during a run,
-    // so an index built under it stays keyed the way this probe reads it. Under
-    // the codepoint collation — the default — this is a discriminant test and
-    // every key below is the one it always was.
-    let active = collation::resolve_default(static_context);
-    let collation = active.as_ref();
-    let cache = ctx.general_compare_cache_mut();
+    // so an index built under it stays keyed the way this probe reads it. It is
+    // resolved — through the per-run memo — only when a string key is needed.
+    // Under the codepoint collation — the default — this is a discriminant test
+    // and every key below is the one it always was.
+    let (cache, deferred) = ctx.compare_cache_and_default_collation();
+    let collation = deferred.as_ref();
     let state = cache.state_mut(arena_id, node)?;
     let State::Ready(ready) = state else {
         return None;
