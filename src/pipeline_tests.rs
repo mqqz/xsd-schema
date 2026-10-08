@@ -3931,6 +3931,111 @@ fn load_strict(xsd: &str, xsd11: bool) -> SchemaResult<PipelineStats> {
     load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
 }
 
+/// W3C msData/particles/particlesZ001.xsd: the suite accepts this schema
+/// using a lax interpretation of RecurseAsIfGroup for repeated choices.
+#[test]
+fn test_xsd10_conformance_particles_z001() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:complexType name="Base">
+            <xs:sequence>
+                <xs:element name="annotation" minOccurs="0"/>
+                <xs:choice minOccurs="0" maxOccurs="unbounded">
+                    <xs:element name="element"/>
+                    <xs:element name="any"/>
+                </xs:choice>
+            </xs:sequence>
+        </xs:complexType>
+        <xs:complexType name="Derived">
+            <xs:complexContent><xs:restriction base="Base">
+                <xs:sequence>
+                    <xs:element name="annotation" minOccurs="0"/>
+                    <xs:element name="element" minOccurs="0" maxOccurs="unbounded"/>
+                </xs:sequence>
+            </xs:restriction></xs:complexContent>
+        </xs:complexType>
+    </xs:schema>"#;
+    let result = load_strict(xsd, false);
+    assert!(result.is_ok(), "particlesZ001: {result:?}");
+}
+
+/// W3C msData/particles/particlesHa165.xsd: normalization folds the
+/// single-child choice's 1..2 range into its element.
+#[test]
+fn test_xsd10_conformance_particles_ha165() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:complexType name="base">
+            <xs:sequence>
+                <xs:choice maxOccurs="2">
+                    <xs:element name="a" type="xs:string"/>
+                    <xs:element name="b" type="xs:string"/>
+                </xs:choice>
+            </xs:sequence>
+        </xs:complexType>
+        <xs:complexType name="derived">
+            <xs:complexContent><xs:restriction base="base">
+                <xs:sequence>
+                    <xs:choice maxOccurs="2">
+                        <xs:element name="a" type="xs:string"/>
+                    </xs:choice>
+                </xs:sequence>
+            </xs:restriction></xs:complexContent>
+        </xs:complexType>
+    </xs:schema>"#;
+    let result = load_strict(xsd, false);
+    assert!(result.is_ok(), "particlesHa165: {result:?}");
+}
+
+/// W3C msData/particles/particlesHa167.xsd: normalization folds the
+/// single-child sequence's 1..2 range into its element.
+#[test]
+fn test_xsd10_conformance_particles_ha167() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:complexType name="base">
+            <xs:sequence>
+                <xs:choice maxOccurs="2">
+                    <xs:element name="a" type="xs:string"/>
+                    <xs:element name="b" type="xs:string"/>
+                </xs:choice>
+            </xs:sequence>
+        </xs:complexType>
+        <xs:complexType name="derived">
+            <xs:complexContent><xs:restriction base="base">
+                <xs:sequence>
+                    <xs:sequence maxOccurs="2">
+                        <xs:element name="a" type="xs:string"/>
+                    </xs:sequence>
+                </xs:sequence>
+            </xs:restriction></xs:complexContent>
+        </xs:complexType>
+    </xs:schema>"#;
+    let result = load_strict(xsd, false);
+    assert!(result.is_ok(), "particlesHa167: {result:?}");
+}
+
+/// W3C msData/particles/particlesV009.xsd: a sequence with range 1..2
+/// restricts a choice with range 0..2, before single-child normalization.
+#[test]
+fn test_xsd10_conformance_particles_v009() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:complexType name="B">
+            <xs:choice minOccurs="0" maxOccurs="2">
+                <xs:element name="e1"/>
+                <xs:element name="e2"/>
+                <xs:element name="e3"/>
+            </xs:choice>
+        </xs:complexType>
+        <xs:complexType name="R">
+            <xs:complexContent><xs:restriction base="B">
+                <xs:sequence maxOccurs="2">
+                    <xs:element name="e1"/>
+                </xs:sequence>
+            </xs:restriction></xs:complexContent>
+        </xs:complexType>
+    </xs:schema>"#;
+    let result = load_strict(xsd, false);
+    assert!(result.is_ok(), "particlesV009: {result:?}");
+}
+
 /// §3.9.6 RecurseLax maps the *raw* {particles} of the two choices and checks
 /// the choices' own occurrence ranges separately.  Folding the parent choice's
 /// occurs into every branch makes each derived branch optional as soon as the
